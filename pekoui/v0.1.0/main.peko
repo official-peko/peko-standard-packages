@@ -1,0 +1,2513 @@
+//! Implements the PekoUI v2 framework. Provides a React-like component
+//! model with stores, pages, and class components, backed by an HTTP
+//! server, a WebSocket server, and a native webview.
+
+import webview@"v0.1.0";
+import sockets@"v0.1.0";
+import json@"v0.1.0";
+import fs@"v0.1.0";
+import threads@"v0.1.0";
+import assets@"v0.1.0";
+
+// ---------------------------------------------------------------------------
+// --- Globals (primitive types only) ---
+// ---------------------------------------------------------------------------
+
+/// Set by the build tooling when running in incremental hot reload mode.
+[hide] debug_mode: bool = false;
+
+/// Directory containing CSS files served by the debug style server. Empty
+/// when not in debug mode.
+[hide] debug_styles_dir: string = "";
+
+/// Port of the debug style server. Read by the build tooling to wire up
+/// hot reload links. Zero until the style server binds.
+[hide] debug_style_port: int = 0;
+
+/// Monotonic counter for Subscriber ids. Ids are never reused.
+[private] next_id_counter: int = 0;
+
+/// Serializes the read-modify-write of next_id_counter. Connections are
+/// each served on their own thread, so two Subscriber constructions can
+/// run at once. Without this lock both read the same value and produce a
+/// duplicate id, which makes the registry hand back the wrong object.
+[private] id_counter_lock: threads::Mutex<int> = threads::Mutex<int>(0);
+
+// ---------------------------------------------------------------------------
+// --- ID helper ---
+// ---------------------------------------------------------------------------
+
+/// Returns the next unused subscriber id.
+[hide] fn next_subscriber_id() => int {
+    id_counter_lock.lock();
+    next_id_counter += 1;
+    assigned := next_id_counter;
+    id_counter_lock.release();
+    return assigned;
+}
+
+// ---------------------------------------------------------------------------
+// --- Subscriber ---
+// ---------------------------------------------------------------------------
+
+/// Base of the reactive protocol. Subclasses are added to a Store's
+/// subscribers list. When the store changes, on_store_changed is
+/// invoked on each subscriber.
+class Subscriber {
+    [hide] subscriber_id: int;
+
+    /// Assigns a unique id on construction through the locked id helper so
+    /// concurrent constructions on different connection threads cannot
+    /// produce duplicate ids.
+    constructor() {
+        this.subscriber_id = next_subscriber_id();
+    }
+
+    /// Called by a store this subscriber is registered with. Default
+    /// does nothing. Subclasses override.
+    fn on_store_changed() {}
+
+    /// Returns the unique subscriber id.
+    [hide] fn get_subscriber_id() => int {
+        return this.subscriber_id;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- Event ---
+// ---------------------------------------------------------------------------
+
+/// Wraps the typed payload of a browser event. Passed to event handler
+/// closures as the local variable `event` injected by the JSX compiler.
+/// The target element reference is stored as a Pointer<void> so this
+/// class can be declared before Element, breaking the dependency cycle.
+class Event {
+    [private] event_type: String;
+    [private] element_id: String;
+    [private] target_ref: Pointer<void>;
+    [private] data:       json::JsonObject;
+
+    /// Constructs an event from a parsed websocket payload.
+    ///
+    /// @param event_type the event kind ("onclick", "onkeydown", and so on)
+    /// @param element_id the uid of the element the event fired on
+    /// @param target_ref a GC-tracked pointer to the Element that fired
+    /// @param data the raw JSON payload from the frontend
+    constructor(
+        event_type: String,
+        element_id: String,
+        target_ref: Pointer<void>,
+        data: json::JsonObject
+    ) {
+        this.event_type = event_type;
+        this.element_id = element_id;
+        this.target_ref = target_ref;
+        this.data       = data;
+    }
+
+    /// Returns the event kind.
+    fn kind() => String {
+        return this.event_type;
+    }
+
+    /// Returns the uid of the element the event fired on.
+    fn element_uid() => String {
+        return this.element_id;
+    }
+
+    /// Returns the raw GC pointer to the Element that fired the event.
+    /// Callers can cast it back with `as Element`.
+    fn target_ref_raw() => Pointer<void> {
+        return this.target_ref;
+    }
+
+    /// Returns the current value of the target element. Empty when the
+    /// payload did not carry a value field.
+    fn value() => String {
+        if !this.data.contains(String("value")) {
+            return String("");
+        }
+        v_opt := this.data[String("value")];
+        if !v_opt.is_value() {
+            return String("");
+        }
+        v := v_opt?;
+        if v.get_type() != "string" {
+            return String("");
+        }
+        s := v as json::JsonString;
+        return s.get_string();
+    }
+
+    /// Returns the map of form field name to value. Populated only for
+    /// onsubmit events. The bootstrap delivers a parallel "form_keys"
+    /// array alongside the form_data object so this method can iterate
+    /// the known field names.
+    fn form_data() => Map<String, String> {
+        out := Map<String, String>();
+        if !this.data.contains(String("form_keys")) {
+            return out;
+        }
+        if !this.data.contains(String("form_data")) {
+            return out;
+        }
+
+        keys_opt := this.data[String("form_keys")];
+        if !keys_opt.is_value() {
+            return out;
+        }
+        keys_val := keys_opt?;
+        if keys_val.get_type() != "array" {
+            return out;
+        }
+        keys_arr := keys_val as json::JsonArray;
+
+        data_opt := this.data[String("form_data")];
+        if !data_opt.is_value() {
+            return out;
+        }
+        data_val := data_opt?;
+        if data_val.get_type() != "object" {
+            return out;
+        }
+        data_obj := data_val as json::JsonObject;
+
+        i := 0;
+        while i < keys_arr.length() {
+            k_opt := keys_arr[i];
+            if k_opt.is_value() {
+                k_val := k_opt?;
+                if k_val.get_type() == "string" {
+                    k_str := k_val as json::JsonString;
+                    field_name := k_str.get_string();
+                    field_val_opt := data_obj[field_name];
+                    if field_val_opt.is_value() {
+                        field_val := field_val_opt?;
+                        if field_val.get_type() == "string" {
+                            v_str := field_val as json::JsonString;
+                            out.insert(field_name, v_str.get_string());
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+        return out;
+    }
+
+    /// Returns the keyboard key name. Empty when not a keyboard event.
+    fn key() => String {
+        return this.read_string_field(String("key"));
+    }
+
+    /// Returns the keyboard key code. Zero when not a keyboard event.
+    fn key_code() => int {
+        return this.read_int_field(String("key_code"), 0);
+    }
+
+    /// Returns true when shift was held during the event.
+    fn shift_held() => bool {
+        return this.read_bool_field(String("shift"));
+    }
+
+    /// Returns true when ctrl was held during the event.
+    fn ctrl_held() => bool {
+        return this.read_bool_field(String("ctrl"));
+    }
+
+    /// Returns true when alt was held during the event.
+    fn alt_held() => bool {
+        return this.read_bool_field(String("alt"));
+    }
+
+    /// Returns true when the meta key was held during the event.
+    fn meta_held() => bool {
+        return this.read_bool_field(String("meta"));
+    }
+
+    /// Returns the client X coordinate. -1 when not applicable.
+    fn mouse_x() => int {
+        return this.read_int_field(String("mouse_x"), -1);
+    }
+
+    /// Returns the client Y coordinate. -1 when not applicable.
+    fn mouse_y() => int {
+        return this.read_int_field(String("mouse_y"), -1);
+    }
+
+    /// Returns the mouse button id. 0 is left, 1 is middle, 2 is right.
+    /// -1 when not applicable.
+    fn mouse_button() => int {
+        return this.read_int_field(String("button"), -1);
+    }
+
+    /// Returns the wheel delta. Zero when not a wheel event.
+    fn wheel_dy() => int {
+        return this.read_int_field(String("wheel_dy"), 0);
+    }
+
+    /// Returns the raw JSON payload for advanced inspection.
+    fn raw() => json::JsonObject {
+        return this.data;
+    }
+
+    [private] fn read_string_field(name: String) => String {
+        if !this.data.contains(name) {
+            return String("");
+        }
+        v_opt := this.data[name];
+        if !v_opt.is_value() {
+            return String("");
+        }
+        v := v_opt?;
+        if v.get_type() != "string" {
+            return String("");
+        }
+        s := v as json::JsonString;
+        return s.get_string();
+    }
+
+    [private] fn read_int_field(name: String, fallback: int) => int {
+        if !this.data.contains(name) {
+            return fallback;
+        }
+        v_opt := this.data[name];
+        if !v_opt.is_value() {
+            return fallback;
+        }
+        v := v_opt?;
+        if v.get_type() != "number" {
+            return fallback;
+        }
+        n := v as json::JsonNumber;
+        return n.get_number() as int;
+    }
+
+    [private] fn read_bool_field(name: String) => bool {
+        s := this.read_string_field(name);
+        return s == "true";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- Element ---
+// ---------------------------------------------------------------------------
+
+/// Represents an HTML element produced by JSX or constructed directly.
+/// The constructor signature is fixed because the Peko compiler emits
+/// calls to it from JSX expressions.
+///
+/// @example {
+/// el := Element(tag_name=String("div"));
+/// el.set_attribute(String("class"), String("card"));
+/// el.append_child(Element(tag_name=String("p"), inner_text=String("hello")));
+/// }
+class Element {
+    [private] tag_name:   String;
+    [private] attributes: Map<String, String>;
+    [private] children:   Array<Element>;
+    [private] inner_text: String;
+    [private] events:     Map<String, closure(Event) => void>;
+
+    /// Constructs an element. Defaults give an empty untagged node.
+    ///
+    /// @param tag_name the element tag name
+    /// @param attributes the attribute map
+    /// @param children the child elements
+    /// @param inner_text the text content
+    /// @param events handler closures keyed by event kind
+    constructor(
+        tag_name: String = String(""),
+        attributes: Map<String, String> = Map<String, String>(),
+        children: Array<Element> = Array<Element>(),
+        inner_text: String = String(""),
+        events: Map<String, closure(Event) => void> = Map<String, closure(Event) => void>()
+    ) {
+        this.tag_name   = tag_name;
+        this.attributes = attributes;
+        this.children   = children;
+        this.inner_text = inner_text;
+        this.events     = events;
+    }
+
+    // --- Getters ---
+
+    /// Returns the tag name.
+    fn get_tag_name() => String {
+        return this.tag_name;
+    }
+
+    /// Returns the attribute map.
+    fn get_attributes() => Map<String, String> {
+        return this.attributes;
+    }
+
+    /// Returns the value of the named attribute, or None when absent.
+    ///
+    /// @param attribute the attribute name
+    fn get_attribute(attribute: String) => String? {
+        return this.attributes.get(attribute);
+    }
+
+    /// Returns the inner text.
+    fn get_inner_text() => String {
+        return this.inner_text;
+    }
+
+    /// Returns all direct children.
+    fn get_children() => Array<Element> {
+        return this.children;
+    }
+
+    /// Returns the child at index idx, or None when out of bounds.
+    ///
+    /// @param idx the index to look up
+    fn get_nth_child(idx: int) => Element? {
+        if idx < 0 || idx >= this.children.length() {
+            return None;
+        }
+        return this.children[idx];
+    }
+
+    /// Returns the handler closure for the given event kind, or None.
+    ///
+    /// @param event_kind the event kind to look up
+    fn get_event(event_kind: String) => Option<closure(Event) => void> {
+        return this.events.get(event_kind);
+    }
+
+    /// Returns the full events map.
+    fn get_events() => Map<String, closure(Event) => void> {
+        return this.events;
+    }
+
+    // --- Mutation ---
+
+    /// Sets or replaces an attribute.
+    ///
+    /// @param attribute the attribute name
+    /// @param value the value to set
+    [mutates] fn set_attribute(attribute: String, value: String) {
+        this.attributes.insert(attribute, value);
+    }
+
+    /// Removes an attribute. Returns the removed value, or None when
+    /// the attribute was not present.
+    ///
+    /// @param attribute the attribute name
+    [mutates] fn remove_attribute(attribute: String) => String? {
+        if !this.attributes.contains(attribute) {
+            return None;
+        }
+        return this.attributes.remove(attribute);
+    }
+
+    /// Replaces the inner text and clears any children.
+    ///
+    /// @param inner_text the new text
+    [mutates] fn set_inner_text(inner_text: String) {
+        this.children   = Array<Element>();
+        this.inner_text = inner_text;
+    }
+
+    /// Appends a child element.
+    ///
+    /// @param child the child to append
+    [mutates] fn append_child(child: Element) {
+        this.children.push(child);
+    }
+
+    /// Removes the child at index idx. Returns the removed child or
+    /// None when the index is out of bounds.
+    ///
+    /// @param idx the index to remove
+    [mutates] fn remove_nth_child(idx: int) => Element? {
+        if idx < 0 || idx >= this.children.length() {
+            return None;
+        }
+        return this.children.remove(idx);
+    }
+
+    /// Registers an event handler for an event kind.
+    ///
+    /// @param event_kind the kind to listen for
+    /// @param handler the closure to invoke
+    [mutates] fn add_event_listener(event_kind: String, handler: closure(Event) => void) {
+        this.events.insert(event_kind, handler);
+    }
+
+    // --- Tree queries ---
+
+    /// Returns all descendant elements (and this element) that have the
+    /// given class attribute value.
+    ///
+    /// @param class_name the class value to match
+    fn get_elements_by_class_name(class_name: String) => Array<Element> {
+        found := Array<Element>();
+        cls := this.get_attribute(String("class"));
+        if cls.is_value() && cls? == class_name {
+            found.push(this);
+        }
+        for child in this.children {
+            found.extend(child.get_elements_by_class_name(class_name));
+        }
+        return found;
+    }
+
+    /// Returns all descendant elements (and this element) with the given
+    /// tag name.
+    ///
+    /// @param tag_name the tag name to match
+    fn get_elements_by_tag_name(tag_name: String) => Array<Element> {
+        found := Array<Element>();
+        if this.tag_name == tag_name {
+            found.push(this);
+        }
+        for child in this.children {
+            found.extend(child.get_elements_by_tag_name(tag_name));
+        }
+        return found;
+    }
+
+    /// Returns the first descendant (or this element) with the given id
+    /// attribute, or None when not found.
+    ///
+    /// @param id the id value to match
+    fn get_element_by_id(id: String) => Element? {
+        my_id := this.get_attribute(String("id"));
+        if my_id.is_value() && my_id? == id {
+            return this;
+        }
+        for child in this.children {
+            found := child.get_element_by_id(id);
+            if found.is_value() {
+                return found;
+            }
+        }
+        return None;
+    }
+
+    /// Returns the element whose _uid_ attribute matches the given uid.
+    /// Returns None when not found.
+    ///
+    /// @param uid the uid to match
+    [hide] fn get_element_by_uid(uid: String) => Element? {
+        my_uid := this.get_attribute(String("_uid_"));
+        if my_uid.is_value() && my_uid? == uid {
+            return this;
+        }
+        for child in this.children {
+            found := child.get_element_by_uid(uid);
+            if found.is_value() {
+                return found;
+            }
+        }
+        return None;
+    }
+
+    // --- Rendering ---
+
+    /// Renders this element to a string. When with_tag is true the
+    /// output includes the open and close tags of this element. An
+    /// element with no tag_name renders as a span so its _uid_ remains
+    /// reachable from the DOM (otherwise the uid attribute has no
+    /// element to attach to, and post-render patches targeting this
+    /// element cannot find it via querySelector).
+    ///
+    /// @param with_tag whether to include this element's own tags
+    fn render(with_tag: bool) => String {
+        out := String();
+
+        emit_tag: string = this.tag_name as string;
+        if emit_tag == "" {
+            emit_tag = "span";
+        }
+
+        if with_tag {
+            out.push("<");
+            out.push(emit_tag);
+            for attr in this.attributes {
+                out.push(" ");
+                out.push(attr.get_first());
+                out.push("=\"");
+                out.push(attr.get_second());
+                out.push("\"");
+            }
+            out.push(">");
+        }
+
+        out.push(this.inner_text);
+
+        for child in this.children {
+            out.push(child.render(true));
+        }
+
+        if with_tag {
+            out.push("</");
+            out.push(emit_tag);
+            out.push(">");
+        }
+
+        return out;
+    }
+
+    /// Renders this element with its own tags.
+    fn render() => String {
+        return this.render(true);
+    }
+
+    [operator to_string]() => string {
+        return this.render(true) as string;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- Component registry forward declarations ---
+// ---------------------------------------------------------------------------
+
+// These forward declarations are placed before Component so the
+// Component constructor body can call register_component. They take a
+// Subscriber rather than a Component because Component is not yet
+// defined at this point in the file. Any Component is-a Subscriber, so
+// passing `this` from a Component constructor works through upcast.
+[hide] fn register_component(c: Subscriber);
+[hide] fn unregister_component(id: int);
+
+// ---------------------------------------------------------------------------
+// --- Component ---
+// ---------------------------------------------------------------------------
+
+/// A reusable UI unit. Subclasses override render() and may hold [state]
+/// fields. State mutations trigger an automatic refresh of the page this
+/// component is mounted under.
+class Component from Subscriber {
+    [hide] refresh_handler: closure() => void;
+    [hide] has_mounted:     bool;
+
+    /// Initializes the refresh handler to a no-op. The handler is set by
+    /// the owning Page when this component is mounted. Also registers
+    /// this component in the global registry so the auto-mount walk can
+    /// find it.
+    constructor() => super() {
+        this.refresh_handler = closure() {};
+        this.has_mounted = false;
+        register_component(this);
+    }
+
+    /// Override to produce the element tree.
+    fn render() => Element {
+        return Element(tag_name=String("div"), inner_text=String("Override render()"));
+    }
+
+    /// Lifecycle hook called by the owning Page the first time this
+    /// component is mounted. Override to subscribe to stores or perform
+    /// other one-time setup. Runs while the program is live, so module
+    /// globals (such as store instances) are guaranteed initialized.
+    /// The default does nothing.
+    fn on_mount() {}
+
+    /// Internal wrapper around render() that tags the produced element
+    /// with this component's subscriber id. The post-render walk uses
+    /// the tag to find and mount embedded components.
+    [hide] fn final_render() => Element {
+        el := this.render();
+        el.set_attribute(String("_pekoui_owner_"), String(`${this.subscriber_id}`));
+        return el;
+    }
+
+    /// Compiler hook fired after any [state] field is mutated. Refreshes
+    /// the page this component is mounted under.
+    ///
+    /// @param attr_name the name of the mutated field
+    fn onStateChanged(attr_name: string) {
+        refresher := this.refresh_handler;
+        refresher();
+    }
+
+    /// Called when a subscribed store changes. Triggers a refresh.
+    fn on_store_changed() {
+        refresher := this.refresh_handler;
+        refresher();
+    }
+
+    /// Set by the owning Page during mounting. Not for user code.
+    [hide mutates] fn set_refresh_handler(handler: closure() => void) {
+        this.refresh_handler = handler;
+    }
+
+    /// Returns whether on_mount has already run for this component.
+    [hide] fn get_has_mounted() => bool {
+        return this.has_mounted;
+    }
+
+    /// Marks this component as having had on_mount run. Not for user
+    /// code.
+    [hide mutates] fn set_has_mounted(value: bool) {
+        this.has_mounted = value;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- Component registry ---
+// ---------------------------------------------------------------------------
+
+/// Holds every Subscriber for the auto-mount tree walk. Every Component
+/// constructor adds itself here via register_component; the auto-mount
+/// walk scans by id and downcasts the entry to Component when it finds it.
+///
+/// The array lives inside the Mutex. It is reached from component
+/// constructors on any server thread, so the only way to touch it is
+/// through registry_mutex.lock(), which serializes every read and write.
+/// Each accessor holds the lock only around the array operation and never
+/// across a render, a constructor, or other user code. The element buffer
+/// is an array of managed pointers, which the collector relocates
+/// directly, so entries stay valid across a compaction.
+[private] registry_mutex: threads::Mutex<Array<Subscriber>> = threads::Mutex<Array<Subscriber>>(Array<Subscriber>());
+
+/// Serializes whole-handler execution so an HTTP request handler and a
+/// WebSocket message handler never run at the same time. Both allocate
+/// heavily and mutate shared app state, and a browser reload drives both
+/// at once. The lock is taken at the single handler call site in each
+/// callback closure and released when the handler returns, so it is held
+/// only during handler computation and never across a socket send.
+[private] handler_serialize_lock: threads::Mutex<int> = threads::Mutex<int>(0);
+
+/// Adds a component to the registry. Subscriber ids are unique and a
+/// component registers once in its constructor, so a plain push is enough.
+[hide] fn register_component(c: Subscriber) {
+    arr := registry_mutex.lock();
+    arr.push(c);
+    registry_mutex.release();
+}
+
+/// Removes a component from the registry by id.
+[hide] fn unregister_component(id: int) {
+    arr := registry_mutex.lock();
+    i := 0;
+    while i < arr.length() {
+        if arr[i].get_subscriber_id() == id {
+            arr.remove(i);
+            break;
+        }
+        i += 1;
+    }
+    registry_mutex.release();
+}
+
+/// Returns the registered component for an id, or None when the id is
+/// absent. The Subscriber stays valid after release, because it is a
+/// GC-managed object kept live by the array. The registry holds the
+/// subscribers in an Array<Subscriber>, whose element buffer is an array
+/// of managed pointers. The collector relocates each element directly, so
+/// the entries stay valid across a compaction.
+[hide] fn registry_lookup(id: int) => Subscriber? {
+    arr := registry_mutex.lock();
+    result: Subscriber? = None;
+    i := 0;
+    while i < arr.length() {
+        if arr[i].get_subscriber_id() == id {
+            result = arr[i];
+            break;
+        }
+        i += 1;
+    }
+    registry_mutex.release();
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// --- Store ---
+// ---------------------------------------------------------------------------
+
+/// Base class for shared state. Subclasses declare [state] fields and
+/// the framework notifies all subscribers when any of them are mutated.
+///
+/// @example {
+/// class CounterStore from Store {
+///     [state] n: int;
+///     constructor() => super() {
+///         this.n = 0;
+///     }
+///     [mutates] fn increment() {
+///         this.n += 1;
+///     }
+/// }
+/// }
+class Store from Subscriber {
+    [private] subscribers: Array<Subscriber>;
+
+    /// Creates an empty store.
+    constructor() => super() {
+        this.subscribers = Array<Subscriber>();
+    }
+
+    /// Compiler hook fired after any [state] field of a subclass is
+    /// mutated or after any [mutates] method on a [state] field
+    /// returns. Notifies all subscribers.
+    ///
+    /// @param attr_name the name of the mutated field
+    fn onStateChanged(attr_name: string) {
+        for s in this.subscribers {
+            s.on_store_changed();
+        }
+    }
+
+    /// Allows a store to subscribe to another store. Notifies its own
+    /// subscribers when the parent store changes.
+    fn on_store_changed() {
+        for s in this.subscribers {
+            s.on_store_changed();
+        }
+    }
+
+    /// Adds a subscriber. Re-adding the same subscriber is a no-op.
+    ///
+    /// @param s the subscriber to add
+    [mutates] fn subscribe(s: Subscriber) {
+        target_id := s.get_subscriber_id();
+        for existing in this.subscribers {
+            if existing.get_subscriber_id() == target_id {
+                return;
+            }
+        }
+        this.subscribers.push(s);
+    }
+
+    /// Removes a subscriber by id.
+    ///
+    /// @param s the subscriber to remove
+    [mutates] fn unsubscribe(s: Subscriber) {
+        target_id := s.get_subscriber_id();
+        i := 0;
+        while i < this.subscribers.length() {
+            if this.subscribers[i].get_subscriber_id() == target_id {
+                this.subscribers.remove(i);
+                return;
+            }
+            i += 1;
+        }
+    }
+
+    /// Returns the number of attached subscribers.
+    fn subscriber_count() => int {
+        return this.subscribers.length();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- Styling ---
+// ---------------------------------------------------------------------------
+
+// Shared empty closure used by Styling instances that have static CSS.
+// This avoids per-construction closure allocation, which has shown
+// suspect behavior in some builds.
+[hide] styling_empty_closure: closure() => string = closure() => string { return ""; };
+
+/// Holds either a static CSS string or a closure that returns one. The
+/// closure form is used in hot reload runs where the compiler swaps in
+/// a closure returning a "<link>URL" marker pointing at the debug CSS
+/// server.
+class Styling {
+    [private] static_css:  string;
+    [private] dynamic_css: closure() => string;
+    [private] is_dynamic:  bool;
+
+    /// Creates empty styling.
+    constructor() {
+        this.dynamic_css = styling_empty_closure;
+        this.is_dynamic  = false;
+        this.static_css  = "";
+    }
+
+    /// Creates styling from a static CSS string (primitive).
+    ///
+    /// @param css the CSS contents
+    constructor(css: string) {
+        this.dynamic_css = styling_empty_closure;
+        this.is_dynamic  = false;
+        this.static_css  = css;
+    }
+
+    /// Creates styling from a String object. The conversion to the
+    /// primitive string is done explicitly here to avoid an implicit
+    /// conversion at the call site.
+    ///
+    /// @param css the CSS contents
+    constructor(css: String) {
+        cast_css: string = css as string;
+        this.dynamic_css = styling_empty_closure;
+        this.is_dynamic  = false;
+        this.static_css  = cast_css;
+    }
+
+    /// Creates styling from a closure that returns a CSS string or a
+    /// "<link>URL" marker resolved fresh on every render.
+    ///
+    /// @param creator the closure that produces the current CSS
+    constructor(creator: closure() => string) {
+        this.static_css  = "";
+        this.dynamic_css = creator;
+        this.is_dynamic  = true;
+    }
+
+    /// Returns the current CSS or link marker.
+    fn resolve() => string {
+        if this.is_dynamic {
+            creator := this.dynamic_css;
+            return creator();
+        }
+        return this.static_css;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- Page ---
+// ---------------------------------------------------------------------------
+
+/// A Component bound to a route. Pages own a path parameter map, a
+/// title, a Styling, and the list of class components currently mounted
+/// under them.
+class Page from Component {
+    [hide] path_params:        Map<String, String>;
+    [hide] title:              string;
+    [hide] styling:            Styling;
+    [hide] last_rendered:      Element;
+    [hide] mounted_components: Array<Component>;
+    [hide] tree_lock:          threads::Mutex<int>;
+    [hide] current_uri:        String;
+    [hide] pending_nav:        String;
+
+    /// Creates a page with empty styling. To set the styling, call
+    /// set_styling from the subclass constructor body after super().
+    constructor() => super() {
+        this.path_params        = Map<String, String>();
+        this.title              = "";
+        this.styling            = Styling();
+        this.last_rendered      = Element();
+        this.mounted_components = Array<Component>();
+        this.tree_lock          = threads::Mutex<int>(0);
+        this.current_uri        = String("/");
+        this.pending_nav        = String("");
+    }
+
+    /// Requests a navigation to the given URL. The App sends the
+    /// navigation to the frontend after the current event handler
+    /// returns. An empty string means no navigation is pending.
+    ///
+    /// @param url the URL to navigate to
+    [mutates] fn navigate(url: String) {
+        this.pending_nav = url;
+    }
+
+    /// Returns the pending navigation URL. Returns an empty string when
+    /// no navigation is pending.
+    fn get_pending_nav() => String {
+        return this.pending_nav;
+    }
+
+    /// Clears any pending navigation.
+    [mutates] fn clear_pending_nav() {
+        this.pending_nav = String("");
+    }
+
+    /// Sets the page's styling. Called from subclass constructors to
+    /// install the page's CSS after the base constructor runs.
+    ///
+    /// @param styling the page's CSS
+    [mutates] fn set_styling(styling: Styling) {
+        this.styling = styling;
+    }
+
+    /// Returns the value of the named path parameter, or None when
+    /// absent.
+    ///
+    /// @param name the parameter name
+    fn get_param(name: String) => String? {
+        return this.path_params.get(name);
+    }
+
+    /// Sets the window title.
+    ///
+    /// @param title the new title
+    [mutates] fn set_title(title: string) {
+        this.title = title;
+    }
+
+    /// Returns the page's styling.
+    fn get_styling() => Styling {
+        s := this.styling;
+        return s;
+    }
+
+    /// Mounts a class component so its state changes refresh this page.
+    /// Idempotent: re-mounting the same component is a no-op for the
+    /// mounted list, and on_mount runs only once per component.
+    ///
+    /// @param c the component to mount
+    [mutates] fn mount(c: Component) {
+        target_id := c.get_subscriber_id();
+        for existing in this.mounted_components {
+            if existing.get_subscriber_id() == target_id {
+                c.set_refresh_handler(this.build_refresh_handler());
+                return;
+            }
+        }
+        this.mounted_components.push(c);
+        c.set_refresh_handler(this.build_refresh_handler());
+        if !c.get_has_mounted() {
+            c.set_has_mounted(true);
+            c.on_mount();
+        }
+    }
+
+    /// Unmounts a previously mounted component. Clears its refresh
+    /// handler and removes it from the global registry so the GC can
+    /// reclaim it if nothing else holds a reference.
+    ///
+    /// @param c the component to unmount
+    [mutates] fn unmount(c: Component) {
+        target_id := c.get_subscriber_id();
+        i := 0;
+        while i < this.mounted_components.length() {
+            existing := this.mounted_components[i];
+            if existing.get_subscriber_id() == target_id {
+                this.mounted_components.remove(i);
+                existing.set_refresh_handler(closure() {});
+                existing.set_has_mounted(false);
+                unregister_component(target_id);
+                return;
+            }
+            i += 1;
+        }
+    }
+
+    /// Produces the Element rendered for this page on an HTTP request.
+    /// The default calls handle_request and then returns final_render.
+    ///
+    /// @param request the incoming HTTP request
+    fn on_request(request: sockets::HttpRequest) => Element {
+        this.handle_request(request);
+        return this.final_render();
+    }
+
+    /// Receives the HTTP request before the page renders. The default
+    /// does nothing. An override reads the request and updates page
+    /// state. The request method is read through request.request_type()
+    /// and the body through request.get_body(). The page renders with
+    /// final_render after this returns.
+    ///
+    /// @param request the incoming HTTP request
+    fn handle_request(request: sockets::HttpRequest) {
+    }
+
+    /// Forces a re-render. Rarely needed because [state] mutations and
+    /// store notifications already trigger refresh.
+    fn refresh() {
+        refresher := this.refresh_handler;
+        refresher();
+    }
+
+    /// Set by the framework when a request matches this page. Not for
+    /// user code.
+    [hide mutates] fn set_path_params(params: Map<String, String>) {
+        this.path_params = params;
+    }
+
+    /// Set by the framework when handling a request. Not for user
+    /// code.
+    [hide mutates] fn set_current_uri(uri: String) {
+        this.current_uri = uri;
+    }
+
+    /// Returns the URI the page was last rendered for.
+    [hide] fn get_current_uri() => String {
+        return this.current_uri;
+    }
+
+    /// Returns the title.
+    [hide] fn get_title() => string {
+        return this.title;
+    }
+
+    /// Returns the element from the most recent render.
+    [hide] fn get_last_rendered() => Element {
+        return this.last_rendered;
+    }
+
+    /// Caches the element from the most recent render.
+    [hide mutates] fn set_last_rendered(el: Element) {
+        this.last_rendered = el;
+    }
+
+    /// Returns the list of currently mounted class components.
+    [hide] fn get_mounted_components() => Array<Component> {
+        return this.mounted_components;
+    }
+
+    /// Returns the tree lock guarding concurrent render and event
+    /// work.
+    [hide] fn get_tree_lock() => threads::Mutex<int> {
+        return this.tree_lock;
+    }
+
+    /// Builds a refresh closure tied to this page instance.
+    [hide] fn build_refresh_handler() => closure() => void {
+        return closure[this]() {
+            this.refresh();
+        };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- Tree helpers ---
+// ---------------------------------------------------------------------------
+
+/// Assigns stable position-based uids to every element in the tree. The
+/// root element gets the prefix and each child appends -idx.
+///
+/// @param el the root element
+/// @param prefix the uid prefix for el
+[hide] fn assign_positional_uids(el: Element, prefix: String) {
+    el.set_attribute(String("_uid_"), prefix);
+    children := el.get_children();
+    i := 0;
+    while i < children.length() {
+        child := children[i];
+        assign_positional_uids(child, String(`${prefix}-${i}`));
+        i += 1;
+    }
+}
+
+/// Walks the tree and collects every _pekoui_owner_ id into out.
+///
+/// @param el the root to walk
+/// @param out the array to append ids to
+[hide] fn collect_owner_ids(el: Element, out: Array<int>) {
+    owner := el.get_attribute(String("_pekoui_owner_"));
+    if owner.is_value() {
+        out.push(owner? as int);
+    }
+    for child in el.get_children() {
+        collect_owner_ids(child, out);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- JSON serialization helpers ---
+// ---------------------------------------------------------------------------
+
+/// Escapes a string for inclusion inside a JSON string literal. Doubles
+/// backslashes, doubles quotes, and drops newlines.
+///
+/// @param value the raw string to escape
+[hide] fn json_escape(value: String) => String {
+    out := String();
+    for ch in value {
+        if ch == '"' || ch == '\\' {
+            out.push('\\');
+        }
+        if ch != '\n' {
+            out.push(ch);
+        }
+    }
+    return out;
+}
+
+/// Appends one patch entry to the given string buffer.
+///
+/// @param out the buffer the patch is appended to
+/// @param changekind the patch kind
+/// @param uid the target uid
+/// @param key the key parameter for attr or event patches
+/// @param value the value parameter
+[hide] fn append_patch_json(out: String, changekind: String, uid: String, key: String, value: String) {
+    if out.length() > 1 {
+        out.push(",");
+    }
+    out.push("{\"changekind\":\"");
+    out.push(changekind);
+    out.push("\",\"uid\":\"");
+    out.push(uid);
+    out.push("\",\"key\":\"");
+    out.push(key);
+    out.push("\",\"value\":\"");
+    out.push(json_escape(value));
+    out.push("\"}");
+}
+
+// ---------------------------------------------------------------------------
+// --- Diff ---
+// ---------------------------------------------------------------------------
+
+// Forward declaration so diff_positional and diff_keyed can call back into
+// diff_elements (mutual recursion). Element is already defined above.
+[hide] fn diff_elements(old_el: Element, new_el: Element, out: String, depth: int);
+
+/// Returns true when any child of el has a key attribute.
+[hide] fn has_keyed_children(el: Element) => bool {
+    for child in el.get_children() {
+        if child.get_attribute(String("key")).is_value() {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Emits attr and remove_attr patches comparing two elements' attribute
+/// maps. Internal _uid_ and _pekoui_owner_ markers are not emitted as
+/// patches.
+[hide] fn diff_attributes(old_el: Element, new_el: Element, out: String) {
+    uid_opt := old_el.get_attribute(String("_uid_"));
+    if !uid_opt.is_value() {
+        return;
+    }
+    target_uid := uid_opt?;
+
+    new_attrs := new_el.get_attributes();
+    for attr in new_attrs {
+        key := attr.get_first();
+        if key == "_uid_" {
+            continue;
+        }
+        if key == "_pekoui_owner_" {
+            continue;
+        }
+        val := attr.get_second();
+        old_val := old_el.get_attribute(key);
+        if !old_val.is_value() {
+            append_patch_json(out, String("attr"), target_uid, key, val);
+        } else if old_val? != val {
+            append_patch_json(out, String("attr"), target_uid, key, val);
+        }
+    }
+
+    old_attrs := old_el.get_attributes();
+    for attr in old_attrs {
+        key := attr.get_first();
+        if key == "_uid_" {
+            continue;
+        }
+        if key == "_pekoui_owner_" {
+            continue;
+        }
+        if !new_el.get_attribute(key).is_value() {
+            append_patch_json(out, String("remove_attr"), target_uid, key, String(""));
+        }
+    }
+}
+
+/// Emits add_event and remove_event patches comparing two elements'
+/// event maps.
+[hide] fn diff_events(old_el: Element, new_el: Element, out: String) {
+    uid_opt := old_el.get_attribute(String("_uid_"));
+    if !uid_opt.is_value() {
+        return;
+    }
+    target_uid := uid_opt?;
+
+    new_events := new_el.get_events();
+    for entry in new_events {
+        kind := entry.get_first();
+        if !old_el.get_event(kind).is_value() {
+            append_patch_json(out, String("add_event"), target_uid, kind, String(""));
+        }
+    }
+
+    old_events := old_el.get_events();
+    for entry in old_events {
+        kind := entry.get_first();
+        if !new_el.get_event(kind).is_value() {
+            append_patch_json(out, String("remove_event"), target_uid, kind, String(""));
+        }
+    }
+}
+
+/// Emits add_event patches for every handler in a freshly added subtree.
+/// The diff only descends matched nodes through diff_events, so a node
+/// that appears for the first time in a render must have its handlers
+/// registered here. Walks the subtree and emits one add_event per handler
+/// against that element's uid. Call this after the matching add_child so
+/// the client knows about the handlers as soon as the node is inserted.
+///
+/// @param el the root of the added subtree
+/// @param out the buffer the patches are appended to
+[hide] fn emit_added_subtree_events(el: Element, out: String) {
+    uid_opt := el.get_attribute(String("_uid_"));
+    if uid_opt.is_value() {
+        target_uid := uid_opt?;
+        events_map := el.get_events();
+        for entry in events_map {
+            kind := entry.get_first();
+            append_patch_json(out, String("add_event"), target_uid, kind, String(""));
+        }
+    }
+    for child in el.get_children() {
+        emit_added_subtree_events(child, out);
+    }
+}
+
+/// Diffs children by position.
+[hide] fn diff_positional(old_el: Element, new_el: Element, old_children: Array<Element>, new_children: Array<Element>, out: String, depth: int) {
+    uid_opt := old_el.get_attribute(String("_uid_"));
+    if !uid_opt.is_value() {
+        return;
+    }
+    target_uid := uid_opt?;
+
+    old_len := old_children.length();
+    new_len := new_children.length();
+
+    min_len := old_len;
+    if new_len < old_len {
+        min_len = new_len;
+    }
+
+    i := 0;
+    while i < min_len {
+        diff_elements(old_children[i], new_children[i], out, depth + 1);
+        i += 1;
+    }
+
+    i = old_len;
+    while i < new_len {
+        append_patch_json(out, String("add_child"), target_uid, String(""), new_children[i].render(true));
+        emit_added_subtree_events(new_children[i], out);
+        i += 1;
+    }
+
+    i = new_len;
+    while i < old_len {
+        child_uid_opt := old_children[i].get_attribute(String("_uid_"));
+        if child_uid_opt.is_value() {
+            append_patch_json(out, String("remove"), child_uid_opt?, String(""), String(""));
+        }
+        i += 1;
+    }
+}
+
+/// Diffs children by their key attribute.
+[hide] fn diff_keyed(old_el: Element, new_el: Element, old_children: Array<Element>, new_children: Array<Element>, out: String, depth: int) {
+    uid_opt := old_el.get_attribute(String("_uid_"));
+    if !uid_opt.is_value() {
+        return;
+    }
+    target_uid := uid_opt?;
+
+    old_positions := Map<String, int>();
+    i := 0;
+    while i < old_children.length() {
+        k := old_children[i].get_attribute(String("key"));
+        if k.is_value() {
+            old_positions.insert(k?, i);
+        }
+        i += 1;
+    }
+
+    seen_keys := Map<String, bool>();
+
+    j := 0;
+    while j < new_children.length() {
+        nc := new_children[j];
+        nk := nc.get_attribute(String("key"));
+        if !nk.is_value() {
+            j += 1;
+            continue;
+        }
+        key := nk?;
+        seen_keys.insert(key, true);
+
+        if old_positions.contains(key) {
+            old_idx := old_positions[key];
+            diff_elements(old_children[old_idx], nc, out, depth + 1);
+            if old_idx != j {
+                child_uid_opt := old_children[old_idx].get_attribute(String("_uid_"));
+                if child_uid_opt.is_value() {
+                    append_patch_json(out, String("move"), child_uid_opt?, String(""), String(`${j}`));
+                }
+            }
+        } else {
+            append_patch_json(out, String("add_child"), target_uid, String(""), nc.render(true));
+            emit_added_subtree_events(nc, out);
+        }
+
+        j += 1;
+    }
+
+    k_idx := 0;
+    while k_idx < old_children.length() {
+        ok := old_children[k_idx].get_attribute(String("key"));
+        if ok.is_value() && !seen_keys.contains(ok?) {
+            child_uid_opt := old_children[k_idx].get_attribute(String("_uid_"));
+            if child_uid_opt.is_value() {
+                append_patch_json(out, String("remove"), child_uid_opt?, String(""), String(""));
+            }
+        }
+        k_idx += 1;
+    }
+}
+
+/// Walks two element trees and emits patch operations for the
+/// differences.
+///
+/// @param old_el the previous tree
+/// @param new_el the new tree
+/// @param out the buffer the patches are appended to
+/// @param depth the recursion depth, capped to guard against runaway
+[hide] fn diff_elements(old_el: Element, new_el: Element, out: String, depth: int) {
+    if depth > 10000 {
+        return;
+    }
+
+    uid_opt := old_el.get_attribute(String("_uid_"));
+    if !uid_opt.is_value() {
+        return;
+    }
+    target_uid := uid_opt?;
+
+    if old_el.get_tag_name() != new_el.get_tag_name() {
+        append_patch_json(out, String("replace"), target_uid, String(""), new_el.render(true));
+        old_events := old_el.get_events();
+        for entry in old_events {
+            kind := entry.get_first();
+            if !new_el.get_event(kind).is_value() {
+                append_patch_json(out, String("remove_event"), target_uid, kind, String(""));
+            }
+        }
+        emit_added_subtree_events(new_el, out);
+        return;
+    }
+
+    diff_attributes(old_el, new_el, out);
+    diff_events(old_el, new_el, out);
+
+    old_text := old_el.get_inner_text();
+    new_text := new_el.get_inner_text();
+    if old_text != new_text {
+        append_patch_json(out, String("text"), target_uid, String(""), new_text);
+    }
+
+    old_children := old_el.get_children();
+    new_children := new_el.get_children();
+
+    if has_keyed_children(old_el) || has_keyed_children(new_el) {
+        diff_keyed(old_el, new_el, old_children, new_children, out, depth);
+        return;
+    }
+
+    diff_positional(old_el, new_el, old_children, new_children, out, depth);
+}
+
+// ---------------------------------------------------------------------------
+// --- Routing ---
+// ---------------------------------------------------------------------------
+
+/// Splits a path into segments, dropping empty segments.
+///
+/// @param path the path to split
+[hide] fn split_path(path: String) => Array<String> {
+    raw := path.split('/');
+    out := Array<String>();
+    for seg in raw {
+        if seg.length() == 0 {
+            continue;
+        }
+        out.push(seg);
+    }
+    return out;
+}
+
+/// One registered route. Holds the pattern, the parsed segments, and
+/// either a static page instance or a factory closure.
+[private] class RoutePattern {
+    [hide] pattern:     String;
+    [hide] segments:    Array<String>;
+    [hide] has_factory: bool;
+    [hide] static_page: Page;
+    [hide] factory:     closure(Map<String, String>) => Page;
+
+    /// Builds a static instance route.
+    ///
+    /// @param pattern the route pattern
+    /// @param page the page instance
+    constructor(pattern: String, page: Page) {
+        this.pattern     = pattern;
+        this.segments    = split_path(pattern);
+        this.has_factory = false;
+        this.static_page = page;
+        this.factory     = closure(p: Map<String, String>) => Page { return Default; };
+    }
+
+    /// Builds a factory route.
+    ///
+    /// @param pattern the route pattern
+    /// @param factory the page factory closure
+    constructor(pattern: String, factory: closure(Map<String, String>) => Page) {
+        this.pattern     = pattern;
+        this.segments    = split_path(pattern);
+        this.has_factory = true;
+        this.static_page = Default;
+        this.factory     = factory;
+    }
+
+    /// Attempts to match the given request path. On success returns a
+    /// Page with path_params populated. On failure returns None.
+    ///
+    /// @param request_path the request URI without query string
+    fn try_match(request_path: String) => Page? {
+        req_segments := split_path(request_path);
+
+        params := Map<String, String>();
+        my_len := this.segments.length();
+
+        i := 0;
+        while i < my_len {
+            my_seg := this.segments[i];
+
+            if my_seg.length() > 0 && my_seg[0] == '*' {
+                name := String(my_seg.substring(1)?);
+                joined := String();
+                j := i;
+                while j < req_segments.length() {
+                    if joined.length() > 0 {
+                        joined.push("/");
+                    }
+                    joined.push(req_segments[j]);
+                    j += 1;
+                }
+                params.insert(name, joined);
+                return this.materialize(params);
+            }
+
+            if i >= req_segments.length() {
+                return None;
+            }
+            req_seg := req_segments[i];
+
+            if my_seg.length() > 0 && my_seg[0] == ':' {
+                name := String(my_seg.substring(1)?);
+                params.insert(name, req_seg);
+            } else if my_seg != req_seg {
+                return None;
+            }
+
+            i += 1;
+        }
+
+        if req_segments.length() != my_len {
+            return None;
+        }
+
+        return this.materialize(params);
+    }
+
+    /// Returns the integer specificity of this pattern. Higher means
+    /// more specific.
+    fn specificity() => int {
+        score := 0;
+        for seg in this.segments {
+            if seg.length() == 0 {
+                continue;
+            }
+            if seg[0] == '*' {
+                score += 1;
+            } else if seg[0] == ':' {
+                score += 10;
+            } else {
+                score += 100;
+            }
+        }
+        return score;
+    }
+
+    /// Returns the original pattern string.
+    fn get_pattern() => String {
+        return this.pattern;
+    }
+
+    /// Returns the parsed segments.
+    fn get_segments() => Array<String> {
+        return this.segments;
+    }
+
+    [private] fn materialize(params: Map<String, String>) => Page {
+        if this.has_factory {
+            factory := this.factory;
+            page := factory(params);
+            page.set_path_params(params);
+            return page;
+        }
+        this.static_page.set_path_params(params);
+        return this.static_page;
+    }
+}
+
+/// One registered layout. A layout pattern matches a path prefix and
+/// wraps pages whose path starts with it.
+[private] class LayoutPattern {
+    [hide] pattern:  String;
+    [hide] segments: Array<String>;
+    [hide] wrap:     closure(Element) => Element;
+    [hide] styling:  Styling;
+
+    /// Builds a layout pattern.
+    ///
+    /// @param pattern the path pattern
+    /// @param wrap the layout function
+    /// @param styling the layout's CSS
+    constructor(pattern: String, wrap: closure(Element) => Element, styling: Styling) {
+        this.pattern  = pattern;
+        this.segments = split_path(pattern);
+        this.wrap     = wrap;
+        this.styling  = styling;
+    }
+
+    /// Returns true when this layout applies to the given path.
+    ///
+    /// @param request_path the request URI
+    fn matches(request_path: String) => bool {
+        req_segments := split_path(request_path);
+        my_len := this.segments.length();
+
+        i := 0;
+        while i < my_len {
+            my_seg := this.segments[i];
+            if my_seg.length() > 0 && my_seg[0] == '*' {
+                return true;
+            }
+            if i >= req_segments.length() {
+                return false;
+            }
+            if my_seg.length() > 0 && my_seg[0] == ':' {
+                i += 1;
+                continue;
+            }
+            if my_seg != req_segments[i] {
+                return false;
+            }
+            i += 1;
+        }
+
+        return req_segments.length() >= my_len;
+    }
+
+    /// Returns the wrap closure.
+    fn get_wrap() => closure(Element) => Element {
+        return this.wrap;
+    }
+
+    /// Returns the layout's styling.
+    fn get_styling() => Styling {
+        return this.styling;
+    }
+
+    /// Returns the original pattern.
+    fn get_pattern() => String {
+        return this.pattern;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- Document and bootstrap ---
+// ---------------------------------------------------------------------------
+
+/// Walks the tree and groups uids by the events that fire on each.
+///
+/// @param el the root element
+/// @param out the map populated with the gathered uids
+[hide] fn collect_events(el: Element, out: Map<String, Array<String>>) {
+    uid := el.get_attribute(String("_uid_"));
+    if uid.is_value() {
+        events_map := el.get_events();
+        for entry in events_map {
+            kind := entry.get_first();
+            if !out.contains(kind) {
+                out.insert(kind, Array<String>());
+            }
+            uids_arr := out[kind];
+            uids_arr.push(uid?);
+        }
+    }
+    for child in el.get_children() {
+        collect_events(child, out);
+    }
+}
+
+/// Builds a JSON object describing every event kind present on the tree
+/// and the uids of all elements that handle that kind.
+///
+/// @param root the root element of the page
+[hide] fn build_initial_events_json(root: Element) => String {
+    by_kind := Map<String, Array<String>>();
+    collect_events(root, by_kind);
+
+    out := String("{");
+    first := true;
+    for entry in by_kind {
+        kind := entry.get_first();
+        uids := entry.get_second();
+        if !first {
+            out.push(",");
+        }
+        first = false;
+        bare := kind;
+        if bare.starts_with("on") {
+            bare = String(bare.substring(2)?);
+        }
+        out.push("\"");
+        out.push(bare);
+        out.push("\":[");
+        i := 0;
+        while i < uids.length() {
+            if i > 0 {
+                out.push(",");
+            }
+            out.push("\"");
+            out.push(uids[i]);
+            out.push("\"");
+            i += 1;
+        }
+        out.push("]");
+    }
+    out.push("}");
+    return out;
+}
+
+/// Returns the JavaScript text embedded in every served document.
+///
+/// @param ws_port the bound port of the WebSocket server
+/// @param initial_events_json a JSON object mapping event kind to an
+///        array of uids that have a handler on the initial render
+[hide] fn build_bootstrap_js(ws_port: int, initial_events_json: String) => String {
+    out := String();
+    out.push("console.log('[pekoui-js] bootstrap starting');\n");
+    out.push("let ws = new WebSocket('ws://127.0.0.1:");
+    out.push(`${ws_port}`);
+    out.push("');\n");
+    out.push("ws.addEventListener('open',  () => console.log('[pekoui-js] WS open'));\n");
+    out.push("ws.addEventListener('error', e => console.error('[pekoui-js] WS error', e));\n");
+    out.push("ws.addEventListener('close', e => console.log('[pekoui-js] WS close', e.code, e.reason));\n");
+
+    out.push("const ALL_EVENTS = [");
+    out.push("'click','dblclick','contextmenu','mousedown','mouseup','mouseenter','mouseleave',");
+    out.push("'mousemove','mouseover','mouseout','wheel',");
+    out.push("'keydown','keyup','keypress',");
+    out.push("'change','input','submit','reset','focus','blur','select','invalid',");
+    out.push("'touchstart','touchend','touchmove','touchcancel',");
+    out.push("'dragstart','drag','dragend','dragenter','dragleave','dragover','drop',");
+    out.push("'copy','cut','paste',");
+    out.push("'play','pause','ended','volumechange','timeupdate','loadeddata',");
+    out.push("'load','resize','scroll',");
+    out.push("'animationend','transitionend'");
+    out.push("];\n");
+
+    out.push("const EVENT_UIDS = {};\n");
+    out.push("ALL_EVENTS.forEach(k => EVENT_UIDS[k] = new Set());\n");
+
+    out.push("function registerEventUid(kind, uid) {\n");
+    out.push("  let bare = kind;\n");
+    out.push("  if (bare.startsWith('on')) bare = bare.substring(2);\n");
+    out.push("  if (!EVENT_UIDS[bare]) EVENT_UIDS[bare] = new Set();\n");
+    out.push("  EVENT_UIDS[bare].add(uid);\n");
+    out.push("}\n");
+    out.push("function unregisterEventUid(kind, uid) {\n");
+    out.push("  let bare = kind;\n");
+    out.push("  if (bare.startsWith('on')) bare = bare.substring(2);\n");
+    out.push("  if (EVENT_UIDS[bare]) EVENT_UIDS[bare].delete(uid);\n");
+    out.push("}\n");
+
+    out.push("function buildPayload(kind, el, e) {\n");
+    out.push("  const p = {};\n");
+    out.push("  if (el && el.value !== undefined) p.value = String(el.value);\n");
+    out.push("  if (e.key !== undefined) p.key = e.key;\n");
+    out.push("  if (e.keyCode !== undefined) p.key_code = e.keyCode;\n");
+    out.push("  if (e.shiftKey !== undefined) p.shift = e.shiftKey ? 'true' : 'false';\n");
+    out.push("  if (e.ctrlKey !== undefined)  p.ctrl  = e.ctrlKey  ? 'true' : 'false';\n");
+    out.push("  if (e.altKey !== undefined)   p.alt   = e.altKey   ? 'true' : 'false';\n");
+    out.push("  if (e.metaKey !== undefined)  p.meta  = e.metaKey  ? 'true' : 'false';\n");
+    out.push("  if (e.clientX !== undefined) p.mouse_x = e.clientX;\n");
+    out.push("  if (e.clientY !== undefined) p.mouse_y = e.clientY;\n");
+    out.push("  if (e.button !== undefined)  p.button = e.button;\n");
+    out.push("  if (e.deltaY !== undefined)  p.wheel_dy = e.deltaY;\n");
+    out.push("  if (kind === 'submit') {\n");
+    out.push("    const form_data = {};\n");
+    out.push("    const form_keys = [];\n");
+    out.push("    if (el.tagName === 'FORM') {\n");
+    out.push("      el.querySelectorAll('[name]').forEach(input => {\n");
+    out.push("        const name = input.getAttribute('name');\n");
+    out.push("        form_data[name] = String(input.value || '');\n");
+    out.push("        form_keys.push(name);\n");
+    out.push("      });\n");
+    out.push("    }\n");
+    out.push("    p.form_data = form_data;\n");
+    out.push("    p.form_keys = form_keys;\n");
+    out.push("  }\n");
+    out.push("  return p;\n");
+    out.push("}\n");
+
+    out.push("const INPUT_THROTTLE_MS = 50;\n");
+    out.push("const INPUT_LAST_TS = {};\n");
+    out.push("const INPUT_PENDING_TIMER = {};\n");
+    out.push("function dispatchEvent(kind, e) {\n");
+    // A submit marked native opts out of socket dispatch so the browser
+    // performs the form POST. The marker is the "submit" or "data-native"
+    // attribute set to "true" on the submit control or on the form.
+    out.push("  if (kind === 'submit') {\n");
+    out.push("    const sb = e.submitter, fm = e.target;\n");
+    out.push("    const native = (el) => el && el.getAttribute &&\n");
+    out.push("      (el.getAttribute('submit') === 'true' || el.getAttribute('data-native') === 'true');\n");
+    out.push("    if (native(sb) || native(fm)) return;\n");
+    out.push("  }\n");
+    // A plain left-click on an anchor with an href navigates to it. An
+    // anchor with a registered click handler is left to that handler. A
+    // hash href, a new-tab target, or a modified click is left to the
+    // browser.
+    out.push("  if (kind === 'click' && e.button === 0 &&\n");
+    out.push("      !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey) {\n");
+    out.push("    const a = e.target.closest ? e.target.closest('a[href]') : null;\n");
+    out.push("    if (a && (!a.target || a.target === '_self')) {\n");
+    out.push("      const auid = a.getAttribute('_uid_');\n");
+    out.push("      const handled = auid && EVENT_UIDS['click'] && EVENT_UIDS['click'].has(auid);\n");
+    out.push("      const href = a.getAttribute('href');\n");
+    out.push("      if (!handled && href && href.charAt(0) !== '#') {\n");
+    out.push("        e.preventDefault();\n");
+    out.push("        window.location.href = a.href;\n");
+    out.push("        return;\n");
+    out.push("      }\n");
+    out.push("    }\n");
+    out.push("  }\n");
+    out.push("  let el = e.target;\n");
+    out.push("  while (el && el.nodeType === 1) {\n");
+    out.push("    const uid = el.getAttribute('_uid_');\n");
+    out.push("    if (uid && EVENT_UIDS[kind] && EVENT_UIDS[kind].has(uid)) {\n");
+    out.push("      const send = () => {\n");
+    out.push("        console.log('[pekoui-js] dispatching', kind, 'on uid', uid);\n");
+    out.push("        const payload = buildPayload(kind, el, e);\n");
+    out.push("        const msg = { event: { event_type: 'on' + kind, element_id: uid } };\n");
+    out.push("        for (const k in payload) msg.event[k] = payload[k];\n");
+    out.push("        ws.send(JSON.stringify(msg));\n");
+    out.push("      };\n");
+    out.push("      if (kind === 'input' || kind === 'mousemove' || kind === 'scroll' || kind === 'wheel') {\n");
+    out.push("        const key = kind + ':' + uid;\n");
+    out.push("        const now = Date.now();\n");
+    out.push("        const last = INPUT_LAST_TS[key] || 0;\n");
+    out.push("        if (INPUT_PENDING_TIMER[key]) clearTimeout(INPUT_PENDING_TIMER[key]);\n");
+    out.push("        if (now - last >= INPUT_THROTTLE_MS) {\n");
+    out.push("          INPUT_LAST_TS[key] = now;\n");
+    out.push("          send();\n");
+    out.push("        } else {\n");
+    out.push("          INPUT_PENDING_TIMER[key] = setTimeout(() => {\n");
+    out.push("            INPUT_LAST_TS[key] = Date.now();\n");
+    out.push("            INPUT_PENDING_TIMER[key] = null;\n");
+    out.push("            send();\n");
+    out.push("          }, INPUT_THROTTLE_MS - (now - last));\n");
+    out.push("        }\n");
+    out.push("      } else {\n");
+    out.push("        send();\n");
+    // A submit, or a plain left-click on an anchor, is prevented so the
+    // browser does not navigate while the framework handles the event.
+    // Modified clicks fall through so the browser can open a new tab.
+    out.push("        const plainLink = kind === 'click' && el.tagName === 'A' &&\n");
+    out.push("          e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey;\n");
+    out.push("        if (kind === 'submit' || plainLink) e.preventDefault();\n");
+    out.push("      }\n");
+    out.push("      return;\n");
+    out.push("    }\n");
+    out.push("    el = el.parentElement;\n");
+    out.push("  }\n");
+    out.push("}\n");
+
+    out.push("function moveElement(el, idx) {\n");
+    out.push("  const parent = el.parentElement;\n");
+    out.push("  if (!parent) return;\n");
+    out.push("  const ref = parent.children[idx];\n");
+    out.push("  if (ref && ref !== el) parent.insertBefore(el, ref);\n");
+    out.push("  else parent.appendChild(el);\n");
+    out.push("}\n");
+
+    out.push("function applyPatches(patches) {\n");
+    out.push("  patches.forEach(patch => {\n");
+    out.push("    const sel = '[_uid_=\"' + patch.uid + '\"]';\n");
+    out.push("    const el = document.querySelector(sel);\n");
+    out.push("    console.log('[pekoui-js] patch', patch.changekind, 'uid', patch.uid, 'el?', !!el, 'value:', patch.value);\n");
+    out.push("    switch (patch.changekind) {\n");
+    out.push("      case 'replace':      if (el) el.outerHTML = patch.value; break;\n");
+    out.push("      case 'text':         if (el) el.innerHTML = patch.value; break;\n");
+    out.push("      case 'attr':         if (el) el.setAttribute(patch.key, patch.value); break;\n");
+    out.push("      case 'remove_attr':  if (el) el.removeAttribute(patch.key); break;\n");
+    out.push("      case 'add_child':    if (el) el.insertAdjacentHTML('beforeend', patch.value); break;\n");
+    out.push("      case 'remove':       if (el) el.remove(); break;\n");
+    out.push("      case 'add_event':    registerEventUid(patch.key, patch.uid); break;\n");
+    out.push("      case 'remove_event': unregisterEventUid(patch.key, patch.uid); break;\n");
+    out.push("      case 'move':         if (el) moveElement(el, parseInt(patch.value)); break;\n");
+    out.push("    }\n");
+    out.push("  });\n");
+    out.push("}\n");
+
+    out.push("function reloadStyles() {\n");
+    out.push("  document.querySelectorAll('link[rel=\"stylesheet\"]').forEach(link => {\n");
+    out.push("    const u = new URL(link.href);\n");
+    out.push("    u.searchParams.set('_', Date.now());\n");
+    out.push("    link.href = u.toString();\n");
+    out.push("  });\n");
+    out.push("}\n");
+
+    out.push("ws.addEventListener('message', e => {\n");
+    out.push("  console.log('[pekoui-js] WS message', e.data);\n");
+    out.push("  try {\n");
+    out.push("    const msg = JSON.parse(e.data);\n");
+    out.push("    console.log('[pekoui-js] parsed msg, changekind=', msg.changekind);\n");
+    out.push("    if (msg.changekind === 'patches') {\n");
+    out.push("      console.log('[pekoui-js] applying', msg.patches.length, 'patches');\n");
+    out.push("      applyPatches(msg.patches);\n");
+    out.push("    } else if (msg.changekind === 'style') {\n");
+    out.push("      reloadStyles();\n");
+    out.push("    } else if (msg.changekind === 'navigate') {\n");
+    out.push("      window.location = msg.url;\n");
+    out.push("    }\n");
+    out.push("  } catch (err) { console.error('[pekoui-js] ws msg error', err, e.data); }\n");
+    out.push("});\n");
+
+    out.push("const INITIAL_EVENTS = ");
+    out.push(initial_events_json);
+    out.push(";\n");
+    out.push("console.log('[pekoui-js] INITIAL_EVENTS', INITIAL_EVENTS);\n");
+    out.push("for (const kind in INITIAL_EVENTS) {\n");
+    out.push("  INITIAL_EVENTS[kind].forEach(uid => registerEventUid(kind, uid));\n");
+    out.push("}\n");
+    out.push("console.log('[pekoui-js] EVENT_UIDS after init:', EVENT_UIDS);\n");
+    out.push("ALL_EVENTS.forEach(kind => document.addEventListener(kind, e => dispatchEvent(kind, e), true));\n");
+    out.push("console.log('[pekoui-js] bootstrap done');\n");
+
+    return out;
+}
+
+/// Builds a style element appropriate for the given styling.
+///
+/// @param styling the styling to render
+[hide] fn build_style_element(styling: Styling) => Element {
+    css := styling.resolve();
+    if Runtime::length(css) > 6 {
+        prefix_opt := String(css).substring(0, 6);
+        if prefix_opt.is_value() {
+            prefix := prefix_opt?;
+            if prefix == "<link>" {
+                href_opt := String(css).substring(6);
+                if href_opt.is_value() {
+                    attrs := Map<String, String>();
+                    attrs.insert(String("rel"), String("stylesheet"));
+                    attrs.insert(String("type"), String("text/css"));
+                    attrs.insert(String("href"), href_opt?);
+                    return Element(tag_name=String("link"), attributes=attrs);
+                }
+            }
+        }
+    }
+    return Element(tag_name=String("style"), inner_text=String(css));
+}
+
+/// Builds the full HTML document for a request.
+///
+/// @param title the window title for this document
+/// @param body_content the rendered page content wrapped in any layouts
+/// @param style_elements the list of style elements to put in the head
+/// @param ws_port the port of the WebSocket server
+[hide] fn build_html_document(title: string, body_content: Element, style_elements: Array<Element>, ws_port: int) => String {
+    head_children := Array<Element>();
+
+    meta_charset_attrs := Map<String, String>();
+    meta_charset_attrs.insert(String("charset"), String("UTF-8"));
+    head_children.push(Element(tag_name=String("meta"), attributes=meta_charset_attrs));
+
+    meta_viewport_attrs := Map<String, String>();
+    meta_viewport_attrs.insert(String("name"), String("viewport"));
+    meta_viewport_attrs.insert(String("content"), String("width=device-width, initial-scale=1.0"));
+    head_children.push(Element(tag_name=String("meta"), attributes=meta_viewport_attrs));
+
+    for sel in style_elements {
+        head_children.push(sel);
+    }
+
+    head_children.push(Element(tag_name=String("title"), inner_text=String(title)));
+
+    initial_events := build_initial_events_json(body_content);
+    boot_js := build_bootstrap_js(ws_port, initial_events);
+    head_children.push(Element(tag_name=String("script"), inner_text=boot_js));
+
+    head := Element(tag_name=String("head"), children=head_children);
+
+    body_attrs := Map<String, String>();
+    body_attrs.insert(String("_uid_"), String("pekotag_body"));
+    body := Element(tag_name=String("body"), attributes=body_attrs);
+    body.append_child(body_content);
+
+    html_attrs := Map<String, String>();
+    html_attrs.insert(String("lang"), String("en"));
+    html_children := Array<Element>();
+    html_children.push(head);
+    html_children.push(body);
+    html := Element(tag_name=String("html"), attributes=html_attrs, children=html_children);
+
+    out := String("<!DOCTYPE html>");
+    out.push(html.render(true));
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// --- DebugServer ---
+// ---------------------------------------------------------------------------
+
+/// Hot reload helper. Runs a small HTTP server that serves CSS files
+/// from the configured styles directory, and a TCP socket that listens
+/// for reload pings from the build tooling. On ping, invokes the
+/// supplied callback to broadcast a style reload message.
+class DebugServer {
+    [hide] style_socket:    sockets::HttpSocket;
+    [hide] update_socket:   sockets::Socket;
+    [hide] on_style_change: closure() => void;
+    [hide] started:         bool;
+
+    /// Constructs the server with a callback fired on every style
+    /// change ping.
+    ///
+    /// @param on_style_change the callback to invoke
+    constructor(on_style_change: closure() => void) {
+        this.style_socket    = sockets::HttpSocket();
+        this.update_socket   = sockets::Socket(7358, closure(req: sockets::Request) => sockets::Response {
+            return sockets::Response(String("OK"));
+        });
+        this.on_style_change = on_style_change;
+        this.started         = false;
+    }
+
+    /// Starts the servers. Sets the global debug_style_port. Idempotent.
+    [mutates] fn start() {
+        if this.started {
+            return;
+        }
+        this.started = true;
+
+        this.style_socket.route(String("/"), closure(request: sockets::HttpRequest) => sockets::HttpResponse {
+            if !request.get(String("style")).is_value() {
+                return sockets::HttpResponse(String(""), 200, String("text/css"));
+            }
+            requested := request.get(String("style"))?;
+            dir := fs::Directory(debug_styles_dir);
+            for f in dir.children() {
+                if f.name() == requested && fs::exists(f.path()) {
+                    return sockets::HttpResponse(fs::read_file(f.path())?, 200, String("text/css"));
+                }
+            }
+            return sockets::HttpResponse(String(""), 200, String("text/css"));
+        });
+
+        this.style_socket.listen();
+        while this.style_socket.get_port() == 0 {}
+
+        debug_style_port = this.style_socket.get_port();
+
+        callback := this.on_style_change;
+        this.update_socket = sockets::Socket(7358, closure[callback](req: sockets::Request) => sockets::Response {
+            callback();
+            return sockets::Response(String("OK"));
+        });
+
+        this.update_socket.listen();
+    }
+
+    /// Returns the bound port of the style HTTP server. Zero until
+    /// start() has run.
+    fn get_style_port() => int {
+        return this.style_socket.get_port();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- App ---
+// ---------------------------------------------------------------------------
+
+/// The top-level entry point. Holds the HTTP server, WebSocket server,
+/// webview, registered routes, registered layouts, and an optional
+/// debug server. Start with run().
+class App {
+    [hide] app_title: string;
+    [hide] width:     int;
+    [hide] height:    int;
+
+    [hide] http_socket:    sockets::Socket;
+    [hide] ws_socket:      sockets::WebSocket;
+    [hide] webview_window: webview::WebView;
+
+    [hide] route_patterns:  Array<RoutePattern>;
+    [hide] layout_patterns: Array<LayoutPattern>;
+    [hide] root_layout:     closure(Element) => Element;
+    [hide] root_styling:    Styling;
+    [hide] has_root_layout: bool;
+
+    [hide] current_page: Page;
+    [hide] has_current:  bool;
+
+    /// Serializes reads and writes of current_page and has_current. These
+    /// two fields are written by the HTTP handler thread and read by the
+    /// WebSocket handler thread, so access goes through this lock to get a
+    /// consistent pair. The lock is a leaf: it is held only around the
+    /// field copy and never across a render.
+    [hide] app_state_lock: threads::Mutex<int>;
+
+    [hide] debug_server: DebugServer;
+
+    /// Creates the App with explicit window dimensions.
+    ///
+    /// @param title the window title
+    /// @param width the window width in pixels
+    /// @param height the window height in pixels
+    constructor(title: string, width: int, height: int) {
+        this.app_title       = title;
+        this.width           = width;
+        this.height          = height;
+        this.route_patterns  = Array<RoutePattern>();
+        this.layout_patterns = Array<LayoutPattern>();
+        this.root_layout     = closure(content: Element) => Element { return content; };
+        this.root_styling    = Styling();
+        this.has_root_layout = false;
+        this.current_page    = Default;
+        this.has_current     = false;
+        this.app_state_lock = threads::Mutex<int>(0);
+        this.http_socket     = sockets::Socket(0);
+        this.ws_socket       = sockets::WebSocket(0);
+        this.webview_window  = Default;
+        this.debug_server    = Default;
+    }
+
+    /// Creates the App with the default window size.
+    ///
+    /// @param title the window title
+    constructor(title: string) {
+        this.app_title       = title;
+        this.width           = 1024;
+        this.height          = 768;
+        this.route_patterns  = Array<RoutePattern>();
+        this.layout_patterns = Array<LayoutPattern>();
+        this.root_layout     = closure(content: Element) => Element { return content; };
+        this.root_styling    = Styling();
+        this.has_root_layout = false;
+        this.current_page    = Default;
+        this.has_current     = false;
+        this.app_state_lock = threads::Mutex<int>(0);
+        this.http_socket     = sockets::Socket(0);
+        this.ws_socket       = sockets::WebSocket(0);
+        this.webview_window  = Default;
+        this.debug_server    = Default;
+    }
+
+    /// Creates the App with empty title and default window size.
+    constructor() {
+        this.app_title       = "";
+        this.width           = 1024;
+        this.height          = 768;
+        this.route_patterns  = Array<RoutePattern>();
+        this.layout_patterns = Array<LayoutPattern>();
+        this.root_layout     = closure(content: Element) => Element { return content; };
+        this.root_styling    = Styling();
+        this.has_root_layout = false;
+        this.current_page    = Default;
+        this.has_current     = false;
+        this.app_state_lock = threads::Mutex<int>(0);
+        this.http_socket     = sockets::Socket(0);
+        this.ws_socket       = sockets::WebSocket(0);
+        this.webview_window  = Default;
+        this.debug_server    = Default;
+    }
+
+    /// Registers a page instance for a route pattern.
+    ///
+    /// @param pattern the pattern (e.g. "/" or "/about")
+    /// @param page the page to serve
+    [mutates] fn add_page(pattern: String, page: Page) {
+        this.route_patterns.push(RoutePattern(pattern, page));
+    }
+
+    /// Registers a factory closure that produces a fresh page per
+    /// request. The factory receives the matched path parameters.
+    ///
+    /// @param pattern the pattern (e.g. "/users/:id")
+    /// @param factory the page factory closure
+    [mutates] fn add_page(pattern: String, factory: closure(Map<String, String>) => Page) {
+        this.route_patterns.push(RoutePattern(pattern, factory));
+    }
+
+    /// Sets the root layout that wraps every page.
+    ///
+    /// @param layout the layout function
+    [mutates] fn set_root_layout(layout: closure(Element) => Element) {
+        this.root_layout     = layout;
+        this.root_styling    = Styling();
+        this.has_root_layout = true;
+    }
+
+    /// Sets the root layout with a stylesheet.
+    ///
+    /// @param layout the layout function
+    /// @param styling the layout's CSS
+    [mutates] fn set_root_layout(layout: closure(Element) => Element, styling: Styling) {
+        this.root_layout     = layout;
+        this.root_styling    = styling;
+        this.has_root_layout = true;
+    }
+
+    /// Adds a per-prefix layout.
+    ///
+    /// @param pattern the path pattern
+    /// @param layout the layout function
+    [mutates] fn add_layout(pattern: String, layout: closure(Element) => Element) {
+        this.layout_patterns.push(LayoutPattern(pattern, layout, Styling()));
+    }
+
+    /// Adds a per-prefix layout with a stylesheet.
+    ///
+    /// @param pattern the path pattern
+    /// @param layout the layout function
+    /// @param styling the layout's CSS
+    [mutates] fn add_layout(pattern: String, layout: closure(Element) => Element, styling: Styling) {
+        this.layout_patterns.push(LayoutPattern(pattern, layout, styling));
+    }
+
+    /// Starts the HTTP server, WebSocket server, optional debug server,
+    /// and webview. Blocks on the webview event loop until the window
+    /// closes.
+    fn run() {
+        if debug_mode {
+            this.debug_server = DebugServer(closure[this]() {
+                this.broadcast_style_reload();
+            });
+            this.debug_server.start();
+        }
+
+        this.install_ws_handler();
+        this.ws_socket.listen();
+        while this.ws_socket.get_port() == 0 {}
+
+        this.install_http_callback();
+        this.http_socket.listen();
+        while this.http_socket.get_port() == 0 {}
+
+        if debug_mode {
+            sockets::Request().body(`{"type": "new_socket", "port": "${this.http_socket.get_port()}", "width": ${this.width}, "height": ${this.height}, "title": "${this.app_title}"}`).send_no_response("127.0.0.1", 7356);
+            while true {
+                threads::sleep(1);
+            }
+        } else {
+            this.webview_window = webview::WebView(this.app_title, this.width, this.height);
+
+            this.webview_window.navigate(`http://localhost:${this.http_socket.get_port()}`);
+
+            this.webview_window.run();
+        }
+    }
+
+    /// Looks up the route pattern matching the given path and returns
+    /// the page it produces. Returns None when no route matches.
+    ///
+    /// @param request_path the request URI
+    [hide] fn resolve_route(request_path: String) => Page? {
+        best_score := -1;
+        best: Page? = None;
+
+        for pattern in this.route_patterns {
+            page_opt := pattern.try_match(request_path);
+            if !page_opt.is_value() {
+                continue;
+            }
+            score := pattern.specificity();
+            if score > best_score {
+                best_score = score;
+                best = page_opt;
+            }
+        }
+
+        return best;
+    }
+
+    /// Returns the layouts that apply to the given path, in the order
+    /// they were registered.
+    ///
+    /// @param request_path the request URI
+    [hide] fn layouts_for(request_path: String) => Array<LayoutPattern> {
+        out := Array<LayoutPattern>();
+        for lp in this.layout_patterns {
+            if lp.matches(request_path) {
+                out.push(lp);
+            }
+        }
+        return out;
+    }
+
+    /// Installs the single catch-all callback that handles every HTTP
+    /// request. Pattern matching against registered routes happens
+    /// inside handle_http rather than at the socket level, because the
+    /// underlying socket does literal URI matching only.
+    [hide] fn install_http_callback() {
+        this.http_socket.set_callback(closure[this](req: sockets::Request) => sockets::Response {
+            gh := handler_serialize_lock.lock();
+            resp := this.handle_http(sockets::HttpRequest(req.get_request()));
+            handler_serialize_lock.release();
+            return resp;
+        });
+    }
+
+    /// Renders the page for an HTTP request and returns the full HTML
+    /// document.
+    ///
+    /// @param req the HTTP request
+    [hide] fn handle_http(req: sockets::HttpRequest) => sockets::HttpResponse {
+        uri := req.uri();
+        method := req.request_type();
+        page_opt := this.resolve_route(uri);
+        if !page_opt.is_value() {
+            return sockets::HttpResponse(String("<h1>404 Not Found</h1>"), 404);
+        }
+        page := page_opt?;
+
+        gs := this.app_state_lock.lock();
+        this.current_page = page;
+        this.has_current  = true;
+        this.app_state_lock.release();
+
+        lock := page.get_tree_lock();
+        guard := lock.lock();
+
+        page.set_current_uri(uri);
+
+        if !page.get_has_mounted() {
+            page.set_has_mounted(true);
+            page.on_mount();
+        }
+
+        content := page.on_request(req);
+
+        wrapped := content;
+        layouts := this.layouts_for(uri);
+        i := layouts.length() - 1;
+        while i >= 0 {
+            wrap := layouts[i].get_wrap();
+            wrapped = wrap(wrapped);
+            i -= 1;
+        }
+        if this.has_root_layout {
+            wrapped = this.root_layout(wrapped);
+        }
+
+        assign_positional_uids(wrapped, String("p0"));
+        page.set_last_rendered(wrapped);
+        this.auto_mount(page, wrapped);
+
+        style_elements := Array<Element>();
+        if this.has_root_layout {
+            style_elements.push(build_style_element(this.root_styling));
+        }
+        for lp in layouts {
+            style_elements.push(build_style_element(lp.get_styling()));
+        }
+        style_elements.push(build_style_element(page.get_styling()));
+
+        html := build_html_document(page.get_title(), wrapped, style_elements, this.ws_socket.get_port());
+        lock.release();
+        return sockets::HttpResponse(html, 200);
+    }
+
+    /// Walks a rendered tree and mounts every component referenced by
+    /// a _pekoui_owner_ marker.
+    ///
+    /// @param page the owning page
+    /// @param root the root of the rendered tree
+    [hide] fn auto_mount(page: Page, root: Element) {
+        ids := Array<int>();
+        collect_owner_ids(root, ids);
+        for id in ids {
+            if id == page.get_subscriber_id() {
+                continue;
+            }
+            entry_opt := registry_lookup(id);
+            if entry_opt.is_value() {
+                entry := entry_opt?;
+                page.mount(entry as Component);
+            }
+        }
+    }
+
+    /// Configures the WS server's message handler.
+    [hide] fn install_ws_handler() {
+        this.ws_socket.set_callback(closure[this](ws: sockets::WebSocket, req: sockets::Request) {
+            gh := handler_serialize_lock.lock();
+            payload := req.get_request();
+            this.handle_ws_message(payload);
+            handler_serialize_lock.release();
+        });
+    }
+
+    /// Parses an inbound WebSocket message and dispatches it to the
+    /// matching event handler on the current page.
+    ///
+    /// @param payload the raw message text
+    [hide] fn handle_ws_message(payload: String) {
+
+        gs := this.app_state_lock.lock();
+        cur_has := this.has_current;
+        page := this.current_page;
+        this.app_state_lock.release();
+
+        if !cur_has {
+            return;
+        }
+        parsed := json::json(payload);
+        if !parsed.is_value() {
+            return;
+        }
+        msg := parsed?;
+        if msg.get_type() != "object" {
+            return;
+        }
+        obj := msg as json::JsonObject;
+        if !obj.contains(String("event")) {
+            return;
+        }
+        ev_opt := obj[String("event")];
+        if !ev_opt.is_value() {
+            return;
+        }
+        ev_raw := ev_opt?;
+        if ev_raw.get_type() != "object" {
+            return;
+        }
+        ev := ev_raw as json::JsonObject;
+        if !ev.contains(String("event_type")) {
+            return;
+        }
+        if !ev.contains(String("element_id")) {
+            return;
+        }
+
+        event_type_opt := ev[String("event_type")];
+        if !event_type_opt.is_value() {
+            return;
+        }
+        event_type_v := event_type_opt?;
+        if event_type_v.get_type() != "string" {
+            return;
+        }
+        event_type_js := event_type_v as json::JsonString;
+        event_type := event_type_js.get_string();
+
+        element_id_opt := ev[String("element_id")];
+        if !element_id_opt.is_value() {
+            return;
+        }
+        element_id_v := element_id_opt?;
+        if element_id_v.get_type() != "string" {
+            return;
+        }
+        element_id_js := element_id_v as json::JsonString;
+        element_id := element_id_js.get_string();
+
+
+        lock := page.get_tree_lock();
+        guard := lock.lock();
+
+        root := page.get_last_rendered();
+        if root == null {
+            lock.release();
+            return;
+        }
+
+        target := root.get_element_by_uid(element_id);
+        if !target.is_value() {
+            lock.release();
+            return;
+        }
+        target_el := target?;
+
+        handler_opt := target_el.get_event(event_type);
+        if !handler_opt.is_value() {
+            lock.release();
+            return;
+        }
+        handler := handler_opt?;
+
+        evt := Event(event_type, element_id, target_el as Pointer<void>, ev);
+
+        handler(evt);
+
+        nav := page.get_pending_nav();
+        if nav != "" {
+            page.clear_pending_nav();
+            msg := String("{\"changekind\":\"navigate\",\"url\":\"");
+            msg.push(nav);
+            msg.push("\"}");
+            this.ws_socket.send_no_response(msg);
+            lock.release();
+            return;
+        }
+
+        this.rerender_and_patch(page);
+        lock.release();
+    }
+
+    /// Re-renders the current page through all matching layouts, runs
+    /// a diff against the previous tree, and sends patches over the
+    /// WS. Assumes the page's tree_lock is already held.
+    ///
+    /// @param page the page to refresh
+    [hide] fn rerender_and_patch(page: Page) {
+        old_root := page.get_last_rendered();
+        if old_root == null {
+            return;
+        }
+
+        content := page.final_render();
+        wrapped := content;
+        uri := page.get_current_uri();
+
+        layouts := this.layouts_for(uri);
+        i := layouts.length() - 1;
+        while i >= 0 {
+            wrap := layouts[i].get_wrap();
+            wrapped = wrap(wrapped);
+            i -= 1;
+        }
+        if this.has_root_layout {
+            wrapped = this.root_layout(wrapped);
+        }
+
+        assign_positional_uids(wrapped, String("p0"));
+        this.auto_mount(page, wrapped);
+
+        out := String("[");
+        diff_elements(old_root, wrapped, out, 0);
+        out.push("]");
+
+        page.set_last_rendered(wrapped);
+
+        if out != "[]" {
+            msg := String("{\"changekind\":\"patches\",\"patches\":");
+            msg.push(out);
+            msg.push("}");
+            this.ws_socket.send_no_response(msg);
+        }
+    }
+
+    /// Sends a style-reload notification to the frontend.
+    [hide] fn broadcast_style_reload() {
+        this.ws_socket.send_no_response(String("{\"changekind\":\"style\"}"));
+    }
+
+    /// Returns the bound HTTP server port. Zero until run() has bound
+    /// it.
+    [hide] fn get_http_port() => int {
+        return this.http_socket.get_port();
+    }
+
+    /// Returns the bound WebSocket server port. Zero until run() has
+    /// bound it.
+    [hide] fn get_ws_port() => int {
+        return this.ws_socket.get_port();
+    }
+}

@@ -1,0 +1,147 @@
+//! Implements basic lexical analysis.
+//! Created for use in parsing JSON and HTTP requests.
+
+/// Represents the different types of tokens that are lexed.
+module TokenType {
+    /// A name made of letters, digits, and underscores.
+    Identifier: int = 0;
+    /// A quoted string.
+    String:     int = 1;
+    /// A numeric value, with an optional decimal point.
+    Number:     int = 2;
+    /// A run of a single whitespace character.
+    Whitespace: int = 3;
+    /// Any other single character.
+    Other:      int = 4;
+}
+
+/// Represents a basic unit of text produced by the lexer.
+class Token {
+    [private] value: String;
+    [private] type:  int;
+
+    /// Creates a new token.
+    ///
+    /// @param value the literal text of the token
+    /// @param type the TokenType id for the token
+    constructor(value: String, type: int) {
+        this.value = value;
+        this.type  = type;
+    }
+
+    /// Returns the literal value of this token.
+    fn get_value() => String {
+        return this.value;
+    }
+
+    /// Returns the type of this token.
+    fn get_type() => int {
+        return this.type;
+    }
+
+    /// Returns true if this token has the provided value and is not a string token.
+    /// Use this instead of comparing value directly to avoid false matches
+    /// when the string content of a token happens to equal a delimiter.
+    ///
+    /// @param value the value to compare against
+    ///
+    /// @example {
+    /// tokens := lexer::tokenize("print(')')");
+    /// tokens_index := 2;
+    ///
+    /// // parse end of function call
+    /// if tokens[tokens_index].value_equals(")") {
+    ///     console::println("End");
+    /// } else {
+    ///     console::println("Not end");
+    /// }
+    /// }
+    fn value_equals(value: String) => bool {
+        return this.value == value && this.type != TokenType::String;
+    }
+}
+
+/// Breaks a string down into a list of tokens.
+///
+/// @param str the text to tokenize
+///
+/// @example {
+/// request_tokens := lexer::tokenize("GET / HTTP/1.1");
+/// if request_tokens[0].value_equals("GET") {
+///     console::println("Success!");
+/// }
+///
+/// // whitespace is also a token, so the url is the third token
+/// if request_tokens[2].value_equals("/") {
+///     respond(render_index());
+/// }
+/// }
+fn tokenize(str: String) => Array<Token> {
+    index      := 0;
+    str_length := str.length();
+    final_tokens := Array<Token>();
+
+    while index < str_length {
+        if Runtime::IsAlpha(str[index]) {
+            // identifier
+            identifier := String();
+            while index < str_length && (Runtime::IsAlnum(str[index]) || str[index] == '_') {
+                identifier.push(str[index]);
+                index += 1;
+            }
+            final_tokens.push(Token(identifier, TokenType::Identifier));
+
+        } else if Runtime::IsDigit(str[index]) || str[index] == '-' {
+            // number
+            is_decimal := false;
+            number     := String();
+            while index < str_length && (Runtime::IsDigit(str[index]) || (str[index] == '.' && !is_decimal) || str[index] == '_' || str[index] == '-') {
+                if str[index] == '.' {
+                    is_decimal = true;
+                }
+                number.push(str[index]);
+                index += 1;
+            }
+            final_tokens.push(Token(number, TokenType::Number));
+
+        } else if str[index] == '"' || str[index] == '\'' {
+            // string
+            string_value := String();
+            delimiter    := str[index];
+            index        += 1;
+
+            while index < str_length && str[index] != delimiter {
+                if str[index] == '\\' {
+                    index += 1;
+                    if str[index] == 'n' {
+                        string_value.push('\n');
+                    } else if str[index] == 't' {
+                        string_value.push('\t');
+                    } else if str[index] == 'r' {
+                        string_value.push('\r');
+                    } else {
+                        string_value.push(str[index]);
+                    }
+                } else {
+                    string_value.push(str[index]);
+                }
+                index += 1;
+            }
+
+            index += 1;
+            final_tokens.push(Token(string_value, TokenType::String));
+
+        } else if str[index] == '\r' || str[index] == '\t' || str[index] == '\n' || str[index] == ' ' {
+            // whitespace
+            final_tokens.push(Token(String(str[index]), TokenType::Whitespace));
+            index += 1;
+
+        } else {
+            // any other single character
+            final_tokens.push(Token(String(str[index]), TokenType::Other));
+            index += 1;
+        }
+    }
+
+    return final_tokens;
+}

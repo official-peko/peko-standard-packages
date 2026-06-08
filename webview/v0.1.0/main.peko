@@ -1,0 +1,280 @@
+//! Implements a cross-platform webview for Peko.
+
+import threads@"v0.1.0";
+
+// ---------------------------------------------------------------------------
+// --- Android ---
+// ---------------------------------------------------------------------------
+
+platform android {
+    link libs::android::android_webview as object;
+    link libs::android::native_glue as object;
+    link libs::android::android_usb_devices as object;
+
+    [external] fn MainWVSetURL(url: cstr);
+    [external] fn CreateMainWV(appname: cstr);
+
+    // Declares the calling thread parked across a blocking native call so
+    // the GC stop-the-world phase can proceed without it.
+    [external notrack] fn pgc_begin_blocking();
+    [external notrack] fn pgc_end_blocking();
+
+    /// A native WebView for rendering HTML.
+    class WebView {
+        [private] title: string;
+        [private] url:   string;
+        [private] running: bool;
+
+        /// Creates a new webview with the provided title.
+        /// Width and height are not used on Android.
+        ///
+        /// @param title the window title
+        /// @param width the window width in pixels
+        /// @param height the window height in pixels
+        constructor(title: String, width: int, height: int) {
+            this.title = title;
+            this.url   = "about:blank";
+            this.running = false;
+        }
+
+        /// Sets the title of this WebView.
+        /// Must be called before run().
+        ///
+        /// @param new_title the new window title
+        [mutates] fn set_title(new_title: string) {
+            this.title = new_title;
+        }
+
+        /// Navigates the WebView to the provided URL.
+        ///
+        /// @param url the URL to navigate to
+        [mutates] fn navigate(url: string) {
+            this.url = url;
+
+            threads::new_thread(closure[url]() {
+                extern::pgc_begin_blocking();
+                extern::MainWVSetURL(url);
+                extern::pgc_end_blocking();
+            });
+        }
+
+        /// Runs the WebView; blocking. The calling thread parks for the
+        /// whole native event loop so the GC can collect without it. The
+        /// title is read into a local before parking so no managed field
+        /// is read while the thread is parked.
+        fn run() {
+            this.running = true;
+            name := this.title;
+
+            extern::pgc_begin_blocking();
+            extern::CreateMainWV(name);
+            extern::pgc_end_blocking();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- iOS ---
+// ---------------------------------------------------------------------------
+
+platform ios {
+    arch x86_64 {
+        link libs::ios::x86_64::webview as object;
+    }
+
+    arch arm {
+        link libs::ios::arm::webview as object;
+    }
+
+    [external] fn createWebview(url: cstr) => int;
+
+    // Declares the calling thread parked across a blocking native call so
+    // the GC stop-the-world phase can proceed without it.
+    [external notrack] fn pgc_begin_blocking();
+    [external notrack] fn pgc_end_blocking();
+
+    /// A native WebView for rendering HTML.
+    class WebView {
+        [private] url: String;
+
+        /// Creates a new webview with the provided URL.
+        /// Width and height are managed by the iOS runtime.
+        ///
+        /// @param url the URL to load
+        /// @param width the window width in pixels
+        /// @param height the window height in pixels
+        constructor(url: String, width: int, height: int) {
+            this.url = url;
+        }
+
+        /// Not supported on iOS. Title is managed by the iOS runtime.
+        ///
+        /// @param new_title the new window title
+        [mutates] fn set_title(new_title: string) {}
+
+        /// Navigates the WebView to the provided URL.
+        /// Must be called before run().
+        ///
+        /// @param url the URL to navigate to
+        [mutates] fn navigate(url: String) {
+            this.url = url;
+        }
+
+        /// Runs the WebView; blocking. The calling thread parks for the
+        /// whole native event loop so the GC can collect without it. The
+        /// URL is read into a local before parking so no managed field is
+        /// read while the thread is parked.
+        fn run() {
+            target := this.url;
+            extern::pgc_begin_blocking();
+            extern::createWebview(target as string);
+            extern::pgc_end_blocking();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- Windows, Linux, macOS ---
+// ---------------------------------------------------------------------------
+
+platform windows {
+    link libs::windows::webview as object;
+}
+
+platform linux {
+    arch x86_64 {
+        link libs::linux::x86_64::webview as object;
+    }
+
+    arch arm {
+        link libs::linux::arm::webview as object;
+    }
+}
+
+platform macos {
+    arch x86_64 {
+        link libs::macos::x86_64::webview as object;
+    }
+
+    arch arm {
+        link libs::macos::arm::webview as object;
+    }
+}
+
+platform windows|linux|macos {
+    [external] fn webview_create(debug: int, window: opaque) => opaque;
+    [external] fn webview_destroy(w: opaque);
+    [external] fn webview_run(w: opaque);
+    [external] fn webview_set_title(w: opaque, title: cstr);
+    [external] fn webview_set_size(w: opaque, width: int, height: int, hints: int);
+    [external] fn webview_navigate(w: opaque, url: cstr);
+    [external] fn webview_set_html(w: opaque, html: cstr);
+
+    // Declares the calling thread parked across a blocking native call so
+    // the GC stop-the-world phase can proceed without it.
+    [external notrack] fn pgc_begin_blocking();
+    [external notrack] fn pgc_end_blocking();
+
+    /// Size hint constants for webview_set_size.
+    module WebViewHint {
+        NoHint: int = 0;
+        Min:   int = 1;
+        Max:   int = 2;
+        Fixed: int = 3;
+    }
+
+    /// A native WebView for rendering HTML.
+    ///
+    /// @example {
+    /// wv := webview::WebView("My App", 800, 600);
+    /// wv.navigate("https://example.com");
+    /// wv.run();
+    /// }
+    class WebView {
+        [private] title:       String;
+        [private] width:       int;
+        [private] height:      int;
+        [private] view_window: opaque;
+        [private] url:         String;
+
+        /// Creates a new WebView with the provided title and dimensions.
+        ///
+        /// @param title the window title
+        /// @param width the window width in pixels
+        /// @param height the window height in pixels
+        constructor(title: String, width: int, height: int) {
+            this.view_window = extern::webview_create(0, null);
+            this.title       = title;
+            this.width       = width;
+            this.height      = height;
+            this.url         = "";
+
+            extern::webview_set_title(this.view_window, title as string);
+            extern::webview_set_size(this.view_window, width, height, WebViewHint::NoHint);
+        }
+
+        /// Creates a new WebView with the provided title, dimensions, and initial URL.
+        ///
+        /// @param title the window title
+        /// @param width the window width in pixels
+        /// @param height the window height in pixels
+        /// @param url the URL to load
+        constructor(title: String, width: int, height: int, url: String) {
+            this.view_window = extern::webview_create(0, null);
+            this.title       = title;
+            this.width       = width;
+            this.height      = height;
+            this.url         = url;
+
+            extern::webview_set_title(this.view_window, title as string);
+            extern::webview_set_size(this.view_window, width, height, WebViewHint::NoHint);
+            extern::webview_navigate(this.view_window, url as string);
+        }
+
+        /// Sets the dimensions of this WebView.
+        ///
+        /// @param width the window width in pixels
+        /// @param height the window height in pixels
+        [mutates] fn set_size(width: int, height: int) {
+            this.width  = width;
+            this.height = height;
+            extern::webview_set_size(this.view_window, width, height, WebViewHint::NoHint);
+        }
+
+        /// Sets the title of this WebView.
+        ///
+        /// @param new_title the new window title
+        [mutates] fn set_title(new_title: string) {
+            this.title = new_title;
+            extern::webview_set_title(this.view_window, this.title as string);
+        }
+
+        /// Navigates this WebView to the provided URL.
+        ///
+        /// @param url the URL to navigate to
+        [mutates] fn navigate(url: String) {
+            this.url = url;
+            extern::webview_navigate(this.view_window, url as string);
+        }
+
+        /// Sets the HTML content for this WebView to render.
+        ///
+        /// @param html the HTML content to render
+        [mutates] fn set_html(html: String) {
+            extern::webview_set_html(this.view_window, html as string);
+        }
+
+        /// Runs this WebView; blocking. The main thread parks for the
+        /// whole native event loop so the GC can collect without it. The
+        /// native window handle is an opaque value, so reading it into a
+        /// local before parking keeps a stable handle. No managed field
+        /// is read while the thread is parked.
+        fn run() {
+            win := this.view_window;
+            extern::pgc_begin_blocking();
+            extern::webview_run(win);
+            extern::pgc_end_blocking();
+            extern::webview_destroy(win);
+        }
+    }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "console",
+  "label": "Standard Console Package",
+  "description": "Implements basic console IO for Peko.",
+  "latest": "v0.1.0",
+  "versions": [
+    "v0.1.0"
+  ]
+}

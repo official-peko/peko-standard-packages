@@ -1,0 +1,9 @@
+{
+  "name": "crypto",
+  "label": "Standard Crypto Package",
+  "description": "Implements basic cryptography functionality for PekoScript.",
+  "latest": "v0.1.0",
+  "versions": [
+    "v0.1.0"
+  ]
+}

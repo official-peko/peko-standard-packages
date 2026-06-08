@@ -1,0 +1,9 @@
+{
+  "name": "threads",
+  "label": "Standard Threading Package",
+  "description": "Implements basic thread and threadsafe functionality.",
+  "latest": "v0.1.0",
+  "versions": [
+    "v0.1.0"
+  ]
+}

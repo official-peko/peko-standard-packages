@@ -1,0 +1,9 @@
+{
+  "name": "runtime",
+  "label": "Peko Runtime",
+  "description": "Implements required Peko runtime functionality, including gc and value casting.",
+  "latest": "v0.1.0",
+  "versions": [
+    "v0.1.0"
+  ]
+}

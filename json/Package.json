@@ -1,0 +1,9 @@
+{
+  "name": "json",
+  "label": "Standard JSON Package",
+  "description": "Implements basic JSON serializing and deserializing.",
+  "latest": "v0.1.0",
+  "versions": [
+    "v0.1.0"
+  ]
+}

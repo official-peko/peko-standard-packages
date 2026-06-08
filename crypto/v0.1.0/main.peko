@@ -1,0 +1,1263 @@
+//! Implements cryptographic operations for Pekoscript via libsodium.
+//! Covers hashing, encoding, secure random, and utilities.
+//! For symmetric encryption see crypto::symmetric.
+//! For asymmetric encryption and signing see crypto::asymmetric.
+//! For key derivation and password hashing see crypto::kdf.
+//! For legacy broken algorithms see crypto::legacy.
+
+import fs@"v0.1.0";
+
+platform android {
+    link libs::android::peko_crypto as object;
+    link libs::android::peko_sodium_anchor as object;
+    link libs::android::libsodium as archive;
+}
+
+platform ios {
+    arch arm {
+        link libs::ios::arm::peko_crypto as object;
+        link libs::ios::arm::peko_sodium_anchor as object;
+        link libs::ios::arm::libsodium as archive;
+    }
+
+    arch x86_64 {
+        link libs::ios::x86_64::peko_crypto as object;
+        link libs::ios::x86_64::peko_sodium_anchor as object;
+        link libs::ios::x86_64::libsodium as archive;
+    }
+}
+
+platform windows {
+    link libs::windows::peko_crypto as object;
+    link libs::windows::peko_sodium_anchor as object;
+    link libs::windows::libsodium as lib;
+}
+
+platform linux {
+    arch arm {
+        link libs::linux::arm::peko_crypto as object;
+        link libs::linux::arm::peko_sodium_anchor as object;
+        link libs::linux::arm::libsodium as archive;
+    }
+
+    arch x86_64 {
+        link libs::linux::x86_64::peko_crypto as object;
+        link libs::linux::x86_64::peko_sodium_anchor as object;
+        link libs::linux::x86_64::libsodium as archive;
+    }
+}
+
+platform macos {
+    arch arm {
+        link libs::macos::arm::peko_crypto as object;
+        link libs::macos::arm::peko_sodium_anchor as object;
+        link libs::macos::arm::libsodium as archive;
+    }
+
+    arch x86_64 {
+        link libs::macos::x86_64::peko_crypto as object;
+        link libs::macos::x86_64::peko_sodium_anchor as object;
+        link libs::macos::x86_64::libsodium as archive;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- C extern declarations ---
+// ---------------------------------------------------------------------------
+
+[external] fn peko_crypto_init() => int;
+
+[external] fn peko_random_bytes(buf: Pointer<void>, len: int);
+[external] fn peko_random_u32() => int;
+
+[external] fn peko_memcmp(a: Pointer<void>, b: Pointer<void>, len: int) => int;
+[external] fn peko_memzero(ptr: Pointer<void>, len: int);
+
+[external] fn peko_bin_to_hex(src: Pointer<void>, src_len: int) => string;
+[external] fn peko_hex_to_bin(hex: cstr, out_len: &int) => Pointer<void>;
+[external] fn peko_base64_encode(src: Pointer<void>, src_len: int, variant: int) => string;
+[external] fn peko_base64_decode(b64: cstr, b64_len: int, variant: int, out_len: &int) => Pointer<void>;
+
+[external] fn peko_sha256(inp: Pointer<void>, in_len: int) => Pointer<void>;
+[external] fn peko_sha512(inp: Pointer<void>, in_len: int) => Pointer<void>;
+[external] fn peko_blake2b(inp: Pointer<void>, in_len: int, key: Pointer<void>, key_len: int, out_len: int) => Pointer<void>;
+
+[external] fn peko_sha256_ctx_new() => opaque;
+[external] fn peko_sha256_update(ctx: opaque, inp: Pointer<void>, in_len: int);
+[external] fn peko_sha256_final(ctx: opaque) => Pointer<void>;
+
+[external] fn peko_sha512_ctx_new() => opaque;
+[external] fn peko_sha512_update(ctx: opaque, inp: Pointer<void>, in_len: int);
+[external] fn peko_sha512_final(ctx: opaque) => Pointer<void>;
+
+[external] fn peko_blake2b_ctx_new(key: Pointer<void>, key_len: int, out_len: int) => opaque;
+[external] fn peko_blake2b_update(ctx: opaque, inp: Pointer<void>, in_len: int);
+[external] fn peko_blake2b_final(ctx: opaque, out_len: int) => Pointer<void>;
+
+[external] fn peko_hmac256_keygen() => Pointer<void>;
+[external] fn peko_hmac256(message: Pointer<void>, message_len: int, key: Pointer<void>) => Pointer<void>;
+[external] fn peko_hmac256_verify(tag: Pointer<void>, message: Pointer<void>, message_len: int, key: Pointer<void>) => int;
+[external] fn peko_hmac512_keygen() => Pointer<void>;
+[external] fn peko_hmac512(message: Pointer<void>, message_len: int, key: Pointer<void>) => Pointer<void>;
+[external] fn peko_hmac512_verify(tag: Pointer<void>, message: Pointer<void>, message_len: int, key: Pointer<void>) => int;
+
+[private] _crypto_init: int = extern::peko_crypto_init();
+
+// ---------------------------------------------------------------------------
+// --- Base64Variant mock-enum ---
+// ---------------------------------------------------------------------------
+
+/// Selects the base64 alphabet variant for encoding and decoding.
+module Base64Variant {
+    /// Standard base64 with padding.
+    Standard:          int = 0;
+    /// URL-safe base64 without padding.
+    UrlSafe:           int = 1;
+    /// URL-safe base64 with padding.
+    UrlSafeNoPadding:  int = 2;
+}
+
+// ---------------------------------------------------------------------------
+// --- Hash output size constants ---
+// ---------------------------------------------------------------------------
+
+/// Output sizes in bytes for each hash algorithm.
+module HashSize {
+    /// SHA-256 digest size in bytes.
+    Sha256:  int = 32;
+    /// SHA-512 digest size in bytes.
+    Sha512:  int = 64;
+    /// Default BLAKE2b digest size in bytes.
+    Blake2b: int = 32;
+}
+
+// ---------------------------------------------------------------------------
+// --- Secure random ---
+// ---------------------------------------------------------------------------
+
+/// Returns a Buffer containing len cryptographically secure random bytes.
+/// Returns None on allocation failure.
+///
+/// @param len the number of random bytes to generate
+///
+/// @example {
+/// key := crypto::random_bytes(32)?;
+/// }
+fn random_bytes(len: int) => fs::Buffer? {
+    buf := Runtime::Allocate<char>(len);
+    extern::peko_random_bytes(buf, len);
+    return fs::Buffer(buf, len, len);
+}
+
+/// Returns a random unsigned 32-bit integer.
+fn random_u32() => int {
+    return extern::peko_random_u32();
+}
+
+// ---------------------------------------------------------------------------
+// --- Secure utilities ---
+// ---------------------------------------------------------------------------
+
+/// Compares two Buffers in constant time.
+/// Returns true if they are equal.
+/// Use this instead of == when comparing secrets to prevent timing attacks.
+///
+/// @param a the first Buffer to compare
+/// @param b the second Buffer to compare
+fn secure_eq(a: fs::Buffer, b: fs::Buffer) => bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    return extern::peko_memcmp(a.as_raw(), b.as_raw(), a.len()) == 0;
+}
+
+/// Zeroes a Buffer in memory.
+/// Use this to clear keys and other secrets after use.
+///
+/// @param buf the Buffer to zero
+fn secure_zero(buf: fs::Buffer) {
+    extern::peko_memzero(buf.as_raw(), buf.len());
+}
+
+// ---------------------------------------------------------------------------
+// --- Encoding ---
+// ---------------------------------------------------------------------------
+
+/// Encodes a Buffer as a lowercase hex string.
+/// Returns None on failure.
+///
+/// @param buf the Buffer to encode
+fn to_hex(buf: fs::Buffer) => string? {
+    return extern::peko_bin_to_hex(buf.as_raw(), buf.len());
+}
+
+/// Decodes a hex string into a Buffer.
+/// Returns None on failure.
+///
+/// @param hex the hex string to decode
+fn from_hex(hex: string) => fs::Buffer? {
+    out_len := 0;
+    data    := extern::peko_hex_to_bin(hex, &out_len);
+    if data == null {
+        return None;
+    }
+    return fs::Buffer(data, out_len, out_len);
+}
+
+/// Encodes a Buffer as a base64 string.
+/// variant controls the alphabet. Use Base64Variant module constants.
+/// Returns None on failure.
+///
+/// @param buf the Buffer to encode
+/// @param variant the base64 variant from the Base64Variant module
+fn to_base64(buf: fs::Buffer, variant: int) => string? {
+    return extern::peko_base64_encode(buf.as_raw(), buf.len(), variant);
+}
+
+/// Encodes a Buffer as standard base64.
+///
+/// @param buf the Buffer to encode
+fn to_base64(buf: fs::Buffer) => string? {
+    return extern::peko_base64_encode(buf.as_raw(), buf.len(), Base64Variant::Standard);
+}
+
+/// Decodes a base64 string into a Buffer.
+/// variant must match the variant used for encoding.
+/// Returns None on failure.
+///
+/// @param b64 the base64 string to decode
+/// @param variant the base64 variant from the Base64Variant module
+fn from_base64(b64: string, variant: int) => fs::Buffer? {
+    out_len := 0;
+    data    := extern::peko_base64_decode(b64, Runtime::length(b64), variant, &out_len);
+    if data == null {
+        return None;
+    }
+    return fs::Buffer(data, out_len, out_len);
+}
+
+/// Decodes a standard base64 string into a Buffer.
+///
+/// @param b64 the base64 string to decode
+fn from_base64(b64: string) => fs::Buffer? {
+    return from_base64(b64, Base64Variant::Standard);
+}
+
+// ---------------------------------------------------------------------------
+// --- One-shot hashing ---
+// ---------------------------------------------------------------------------
+
+/// Computes a SHA-256 hash of the provided Buffer.
+/// Returns a 32-byte Buffer, or None on failure.
+///
+/// @param data the Buffer to hash
+///
+/// @example {
+/// digest := crypto::sha256(data)?;
+/// hex    := crypto::to_hex(digest)?;
+/// }
+fn sha256(data: fs::Buffer) => fs::Buffer? {
+    result := extern::peko_sha256(data.as_raw(), data.len());
+    if result == null {
+        return None;
+    }
+    return fs::Buffer(result, HashSize::Sha256, HashSize::Sha256);
+}
+
+/// Computes a SHA-512 hash of the provided Buffer.
+/// Returns a 64-byte Buffer, or None on failure.
+///
+/// @param data the Buffer to hash
+fn sha512(data: fs::Buffer) => fs::Buffer? {
+    result := extern::peko_sha512(data.as_raw(), data.len());
+    if result == null {
+        return None;
+    }
+    return fs::Buffer(result, HashSize::Sha512, HashSize::Sha512);
+}
+
+/// Computes a BLAKE2b hash of the provided Buffer.
+/// out_len controls the digest size in bytes (16 to 64).
+/// Returns None on failure.
+///
+/// @param data the Buffer to hash
+/// @param out_len the digest size in bytes (16 to 64)
+fn blake2b(data: fs::Buffer, out_len: int) => fs::Buffer? {
+    result := extern::peko_blake2b(data.as_raw(), data.len(), null, 0, out_len);
+    if result == null {
+        return None;
+    }
+    return fs::Buffer(result, out_len, out_len);
+}
+
+/// Computes a keyed BLAKE2b hash of the provided Buffer.
+/// key adds a secret to the hash, producing a MAC-like output.
+/// out_len controls the digest size in bytes (16 to 64).
+/// Returns None on failure.
+///
+/// @param data the Buffer to hash
+/// @param key the secret key to mix into the hash
+/// @param out_len the digest size in bytes (16 to 64)
+fn blake2b(data: fs::Buffer, key: fs::Buffer, out_len: int) => fs::Buffer? {
+    result := extern::peko_blake2b(data.as_raw(), data.len(), key.as_raw(), key.len(), out_len);
+    if result == null {
+        return None;
+    }
+    return fs::Buffer(result, out_len, out_len);
+}
+
+// ---------------------------------------------------------------------------
+// --- Streaming hasher ---
+// ---------------------------------------------------------------------------
+
+/// Streaming SHA-256 hasher.
+/// Use this to hash large files or data that arrives in chunks.
+///
+/// @example {
+/// hasher := crypto::Sha256Hasher();
+/// hasher.update(chunk1);
+/// hasher.update(chunk2);
+/// digest := hasher.finalize()?;
+/// }
+class Sha256Hasher {
+    [private] ctx: opaque;
+    [private] done: bool;
+
+    constructor() {
+        this.ctx  = extern::peko_sha256_ctx_new();
+        this.done = false;
+    }
+
+    /// Feeds more data into the hasher.
+    ///
+    /// @param data the Buffer to add
+    fn update(data: fs::Buffer) {
+        if !this.done {
+            extern::peko_sha256_update(this.ctx, data.as_raw(), data.len());
+        }
+    }
+
+    /// Finalizes the hash and returns a 32-byte Buffer.
+    /// Returns None on failure. The hasher must not be used after this call.
+    fn finalize() => fs::Buffer? {
+        if this.done {
+            return None;
+        }
+        this.done = true;
+        result := extern::peko_sha256_final(this.ctx);
+        if result == null {
+            return None;
+        }
+        return fs::Buffer(result, HashSize::Sha256, HashSize::Sha256);
+    }
+}
+
+/// Streaming SHA-512 hasher.
+class Sha512Hasher {
+    [private] ctx:  opaque;
+    [private] done: bool;
+
+    constructor() {
+        this.ctx  = extern::peko_sha512_ctx_new();
+        this.done = false;
+    }
+
+    /// Feeds more data into the hasher.
+    ///
+    /// @param data the Buffer to add
+    fn update(data: fs::Buffer) {
+        if !this.done {
+            extern::peko_sha512_update(this.ctx, data.as_raw(), data.len());
+        }
+    }
+
+    /// Finalizes the hash and returns a 64-byte Buffer.
+    /// Returns None on failure. The hasher must not be used after this call.
+    fn finalize() => fs::Buffer? {
+        if this.done {
+            return None;
+        }
+        this.done = true;
+        result := extern::peko_sha512_final(this.ctx);
+        if result == null {
+            return None;
+        }
+        return fs::Buffer(result, HashSize::Sha512, HashSize::Sha512);
+    }
+}
+
+/// Streaming BLAKE2b hasher.
+/// Supports optional key for keyed hashing and configurable output length.
+class Blake2bHasher {
+    [private] ctx:     opaque;
+    [private] out_len: int;
+    [private] done:    bool;
+
+    /// Creates a keyless BLAKE2b hasher with the given output length (16 to 64 bytes).
+    ///
+    /// @param out_len the digest size in bytes (16 to 64)
+    constructor(out_len: int) {
+        this.ctx     = extern::peko_blake2b_ctx_new(null, 0, out_len);
+        this.out_len = out_len;
+        this.done    = false;
+    }
+
+    /// Creates a keyed BLAKE2b hasher with the given key and output length.
+    ///
+    /// @param key the secret key to mix into the hash
+    /// @param out_len the digest size in bytes (16 to 64)
+    constructor(key: fs::Buffer, out_len: int) {
+        this.ctx     = extern::peko_blake2b_ctx_new(key.as_raw(), key.len(), out_len);
+        this.out_len = out_len;
+        this.done    = false;
+    }
+
+    /// Feeds more data into the hasher.
+    ///
+    /// @param data the Buffer to add
+    fn update(data: fs::Buffer) {
+        if !this.done {
+            extern::peko_blake2b_update(this.ctx, data.as_raw(), data.len());
+        }
+    }
+
+    /// Finalizes the hash and returns a Buffer of the configured output length.
+    /// Returns None on failure. The hasher must not be used after this call.
+    fn finalize() => fs::Buffer? {
+        if this.done {
+            return None;
+        }
+        this.done = true;
+        result := extern::peko_blake2b_final(this.ctx, this.out_len);
+        if result == null {
+            return None;
+        }
+        return fs::Buffer(result, this.out_len, this.out_len);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- HMAC ---
+// ---------------------------------------------------------------------------
+
+/// Generates a random HMAC-SHA256 key.
+/// Returns a Buffer, or None on failure.
+fn hmac256_keygen() => fs::Buffer? {
+    key := extern::peko_hmac256_keygen();
+    if key == null {
+        return None;
+    }
+    return fs::Buffer(key, 32, 32);
+}
+
+/// Computes an HMAC-SHA256 authentication tag for message using key.
+/// Returns a 32-byte Buffer, or None on failure.
+///
+/// @param message the Buffer to authenticate
+/// @param key the secret key
+fn hmac256(message: fs::Buffer, key: fs::Buffer) => fs::Buffer? {
+    result := extern::peko_hmac256(message.as_raw(), message.len(), key.as_raw());
+    if result == null {
+        return None;
+    }
+    return fs::Buffer(result, 32, 32);
+}
+
+/// Verifies an HMAC-SHA256 tag against a message in constant time.
+/// Returns true if the tag is valid.
+///
+/// @param tag the tag to verify
+/// @param message the Buffer the tag should authenticate
+/// @param key the secret key
+fn hmac256_verify(tag: fs::Buffer, message: fs::Buffer, key: fs::Buffer) => bool {
+    return extern::peko_hmac256_verify(tag.as_raw(), message.as_raw(), message.len(), key.as_raw()) == 1;
+}
+
+/// Generates a random HMAC-SHA512 key.
+/// Returns a Buffer, or None on failure.
+fn hmac512_keygen() => fs::Buffer? {
+    key := extern::peko_hmac512_keygen();
+    if key == null {
+        return None;
+    }
+    return fs::Buffer(key, 64, 64);
+}
+
+/// Computes an HMAC-SHA512 authentication tag for message using key.
+/// Returns a 64-byte Buffer, or None on failure.
+///
+/// @param message the Buffer to authenticate
+/// @param key the secret key
+fn hmac512(message: fs::Buffer, key: fs::Buffer) => fs::Buffer? {
+    result := extern::peko_hmac512(message.as_raw(), message.len(), key.as_raw());
+    if result == null {
+        return None;
+    }
+    return fs::Buffer(result, 64, 64);
+}
+
+/// Verifies an HMAC-SHA512 tag against a message in constant time.
+/// Returns true if the tag is valid.
+///
+/// @param tag the tag to verify
+/// @param message the Buffer the tag should authenticate
+/// @param key the secret key
+fn hmac512_verify(tag: fs::Buffer, message: fs::Buffer, key: fs::Buffer) => bool {
+    return extern::peko_hmac512_verify(tag.as_raw(), message.as_raw(), message.len(), key.as_raw()) == 1;
+}
+
+
+[external] fn peko_secretbox_keygen() => Pointer<void>;
+[external] fn peko_secretbox_nonce() => Pointer<void>;
+[external] fn peko_secretbox_encrypt(plaintext: Pointer<void>, plaintext_len: int, nonce: Pointer<void>, key: Pointer<void>, out_len: &int) => Pointer<void>;
+[external] fn peko_secretbox_decrypt(ciphertext: Pointer<void>, ciphertext_len: int, nonce: Pointer<void>, key: Pointer<void>, out_len: &int) => Pointer<void>;
+
+[external] fn peko_chacha_keygen() => Pointer<void>;
+[external] fn peko_chacha_nonce() => Pointer<void>;
+[external] fn peko_chacha_encrypt(plaintext: Pointer<void>, plaintext_len: int, ad: Pointer<void>, ad_len: int, nonce: Pointer<void>, key: Pointer<void>, out_len: &int) => Pointer<void>;
+[external] fn peko_chacha_decrypt(ciphertext: Pointer<void>, ciphertext_len: int, ad: Pointer<void>, ad_len: int, nonce: Pointer<void>, key: Pointer<void>, out_len: &int) => Pointer<void>;
+
+[external] fn peko_aesgcm_available() => int;
+[external] fn peko_aesgcm_keygen() => Pointer<void>;
+[external] fn peko_aesgcm_nonce() => Pointer<void>;
+[external] fn peko_aesgcm_encrypt(plaintext: Pointer<void>, plaintext_len: int, ad: Pointer<void>, ad_len: int, nonce: Pointer<void>, key: Pointer<void>, out_len: &int) => Pointer<void>;
+[external] fn peko_aesgcm_decrypt(ciphertext: Pointer<void>, ciphertext_len: int, ad: Pointer<void>, ad_len: int, nonce: Pointer<void>, key: Pointer<void>, out_len: &int) => Pointer<void>;
+
+// ---------------------------------------------------------------------------
+// --- XSalsa20-Poly1305 secretbox ---
+// The recommended default for general-purpose secret key encryption.
+// Provides authenticated encryption. Decryption fails if the ciphertext
+// has been tampered with.
+// ---------------------------------------------------------------------------
+
+/// Generates a random 32-byte secret key for use with secretbox functions.
+/// Store this key securely. Never reuse it across different contexts.
+fn secretbox_keygen() => fs::Buffer? {
+    key := extern::peko_secretbox_keygen();
+    if key == null {
+        return None;
+    }
+    return fs::Buffer(key, 32, 32);
+}
+
+/// Generates a random 24-byte nonce for use with secretbox functions.
+/// A new nonce must be generated for every encryption operation with the same key.
+/// Store the nonce alongside the ciphertext - it does not need to be secret.
+fn secretbox_nonce() => fs::Buffer? {
+    n := extern::peko_secretbox_nonce();
+    if n == null {
+        return None;
+    }
+    return fs::Buffer(n, 24, 24);
+}
+
+/// Encrypts plaintext with key and nonce using XSalsa20-Poly1305.
+/// The ciphertext is 16 bytes longer than the plaintext due to the MAC.
+/// Returns None on failure.
+///
+/// @param plaintext the data to encrypt
+/// @param nonce a fresh nonce from secretbox_nonce
+/// @param key the secret key from secretbox_keygen
+///
+/// @example {
+/// key   := crypto::symmetric::secretbox_keygen()?;
+/// nonce := crypto::symmetric::secretbox_nonce()?;
+/// ct    := crypto::symmetric::secretbox_encrypt(plaintext, nonce, key)?;
+/// }
+fn secretbox_encrypt(plaintext: fs::Buffer, nonce: fs::Buffer, key: fs::Buffer) => fs::Buffer? {
+    out_len := 0;
+    result  := extern::peko_secretbox_encrypt(plaintext.as_raw(), plaintext.len(), nonce.as_raw(), key.as_raw(), &out_len);
+    if result == null {
+        return None;
+    }
+    return fs::Buffer(result, out_len, out_len);
+}
+
+/// Decrypts ciphertext with key and nonce using XSalsa20-Poly1305.
+/// Returns None if authentication fails or on error.
+/// Authentication failure means the ciphertext has been tampered with.
+///
+/// @param ciphertext the data to decrypt
+/// @param nonce the nonce used during encryption
+/// @param key the secret key
+fn secretbox_decrypt(ciphertext: fs::Buffer, nonce: fs::Buffer, key: fs::Buffer) => fs::Buffer? {
+    out_len := 0;
+    result  := extern::peko_secretbox_decrypt(ciphertext.as_raw(), ciphertext.len(), nonce.as_raw(), key.as_raw(), &out_len);
+    if result == null {
+        return None;
+    }
+    return fs::Buffer(result, out_len, out_len);
+}
+
+// ---------------------------------------------------------------------------
+// --- ChaCha20-Poly1305 IETF ---
+// Recommended for network protocols. Supports additional authenticated data
+// (ad) which is authenticated but not encrypted (e.g. packet headers).
+// ---------------------------------------------------------------------------
+
+/// Generates a random 32-byte ChaCha20-Poly1305 key.
+fn chacha_keygen() => fs::Buffer? {
+    key := extern::peko_chacha_keygen();
+    if key == null {
+        return None;
+    }
+    return fs::Buffer(key, 32, 32);
+}
+
+/// Generates a random 12-byte ChaCha20-Poly1305 nonce.
+/// A new nonce must be generated for every encryption with the same key.
+fn chacha_nonce() => fs::Buffer? {
+    n := extern::peko_chacha_nonce();
+    if n == null {
+        return None;
+    }
+    return fs::Buffer(n, 12, 12);
+}
+
+/// Encrypts plaintext with optional additional data using ChaCha20-Poly1305.
+/// ad is authenticated but not encrypted. Pass an empty Buffer if not needed.
+/// The ciphertext is 16 bytes longer than the plaintext.
+/// Returns None on failure.
+///
+/// @param plaintext the data to encrypt
+/// @param ad additional data to authenticate but not encrypt
+/// @param nonce a fresh nonce from chacha_nonce
+/// @param key the secret key from chacha_keygen
+///
+/// @example {
+/// key   := crypto::symmetric::chacha_keygen()?;
+/// nonce := crypto::symmetric::chacha_nonce()?;
+/// ct    := crypto::symmetric::chacha_encrypt(plaintext, fs::Buffer(), nonce, key)?;
+/// }
+fn chacha_encrypt(plaintext: fs::Buffer, ad: fs::Buffer, nonce: fs::Buffer, key: fs::Buffer) => fs::Buffer? {
+    out_len := 0;
+    result  := extern::peko_chacha_encrypt(
+        plaintext.as_raw(), plaintext.len(),
+        ad.as_raw(), ad.len(),
+        nonce.as_raw(), key.as_raw(),
+        &out_len
+    );
+    if result == null {
+        return None;
+    }
+    return fs::Buffer(result, out_len, out_len);
+}
+
+/// Decrypts ChaCha20-Poly1305 ciphertext.
+/// ad must match what was used during encryption.
+/// Returns None if authentication fails or on error.
+///
+/// @param ciphertext the data to decrypt
+/// @param ad the additional data used during encryption
+/// @param nonce the nonce used during encryption
+/// @param key the secret key
+fn chacha_decrypt(ciphertext: fs::Buffer, ad: fs::Buffer, nonce: fs::Buffer, key: fs::Buffer) => fs::Buffer? {
+    out_len := 0;
+    result  := extern::peko_chacha_decrypt(
+        ciphertext.as_raw(), ciphertext.len(),
+        ad.as_raw(), ad.len(),
+        nonce.as_raw(), key.as_raw(),
+        &out_len
+    );
+    if result == null {
+        return None;
+    }
+    return fs::Buffer(result, out_len, out_len);
+}
+
+// ---------------------------------------------------------------------------
+// --- AES-256-GCM ---
+// Use for compatibility with systems that require AES.
+// Requires AES-NI hardware support. Check aes_available() first.
+// ---------------------------------------------------------------------------
+
+/// Returns true if AES-256-GCM is available on this CPU.
+/// AES-256-GCM requires hardware AES-NI support and will fail on CPUs without it.
+fn aes_available() => bool {
+    return extern::peko_aesgcm_available() == 1;
+}
+
+/// Generates a random 32-byte AES-256-GCM key.
+fn aes_keygen() => fs::Buffer? {
+    key := extern::peko_aesgcm_keygen();
+    if key == null {
+        return None;
+    }
+    return fs::Buffer(key, 32, 32);
+}
+
+/// Generates a random 12-byte AES-256-GCM nonce.
+/// A new nonce must be generated for every encryption with the same key.
+fn aes_nonce() => fs::Buffer? {
+    n := extern::peko_aesgcm_nonce();
+    if n == null {
+        return None;
+    }
+    return fs::Buffer(n, 12, 12);
+}
+
+/// Encrypts plaintext with optional additional data using AES-256-GCM.
+/// Check aes_available() before calling. Returns None if AES-NI is unavailable.
+///
+/// @param plaintext the data to encrypt
+/// @param ad additional data to authenticate but not encrypt
+/// @param nonce a fresh nonce from aes_nonce
+/// @param key the secret key from aes_keygen
+fn aes_encrypt(plaintext: fs::Buffer, ad: fs::Buffer, nonce: fs::Buffer, key: fs::Buffer) => fs::Buffer? {
+    out_len := 0;
+    result  := extern::peko_aesgcm_encrypt(
+        plaintext.as_raw(), plaintext.len(),
+        ad.as_raw(), ad.len(),
+        nonce.as_raw(), key.as_raw(),
+        &out_len
+    );
+    if result == null {
+        return None;
+    }
+    return fs::Buffer(result, out_len, out_len);
+}
+
+/// Decrypts AES-256-GCM ciphertext.
+/// Returns None if authentication fails, AES-NI is unavailable, or on error.
+///
+/// @param ciphertext the data to decrypt
+/// @param ad the additional data used during encryption
+/// @param nonce the nonce used during encryption
+/// @param key the secret key
+fn aes_decrypt(ciphertext: fs::Buffer, ad: fs::Buffer, nonce: fs::Buffer, key: fs::Buffer) => fs::Buffer? {
+    out_len := 0;
+    result  := extern::peko_aesgcm_decrypt(
+        ciphertext.as_raw(), ciphertext.len(),
+        ad.as_raw(), ad.len(),
+        nonce.as_raw(), key.as_raw(),
+        &out_len
+    );
+    if result == null {
+        return None;
+    }
+    return fs::Buffer(result, out_len, out_len);
+}
+
+
+
+[external] fn peko_box_keypair(public_key_out: opaque, secret_key_out: opaque) => int;
+[external] fn peko_box_nonce() => Pointer<void>;
+[external] fn peko_box_encrypt(plaintext: Pointer<void>, plaintext_len: int, nonce: Pointer<void>, recipient_pk: Pointer<void>, sender_sk: Pointer<void>, out_len: &int) => Pointer<void>;
+[external] fn peko_box_decrypt(ciphertext: Pointer<void>, ciphertext_len: int, nonce: Pointer<void>, sender_pk: Pointer<void>, recipient_sk: Pointer<void>, out_len: &int) => Pointer<void>;
+
+[external] fn peko_sign_keypair(public_key_out: opaque, secret_key_out: opaque) => int;
+[external] fn peko_sign(message: Pointer<void>, message_len: int, secret_key: Pointer<void>, out_len: &int) => Pointer<void>;
+[external] fn peko_sign_verify(signature: Pointer<void>, signature_len: int, message: Pointer<void>, message_len: int, public_key: Pointer<void>) => int;
+
+// ---------------------------------------------------------------------------
+// --- Key pair types ---
+// ---------------------------------------------------------------------------
+
+/// Holds an X25519 key pair for authenticated public key encryption.
+class BoxKeyPair {
+    [private] _public_key:  fs::Buffer;
+    [private] _secret_key:  fs::Buffer;
+
+    constructor(public_key: fs::Buffer, secret_key: fs::Buffer) {
+        this._public_key = public_key;
+        this._secret_key = secret_key;
+    }
+
+    /// Returns the public key. Share this with the other party.
+    fn public_key() => fs::Buffer {
+        return this._public_key;
+    }
+
+    /// Returns the secret key. Never share this.
+    fn secret_key() => fs::Buffer {
+        return this._secret_key;
+    }
+}
+
+/// Holds an Ed25519 key pair for digital signatures.
+class SignKeyPair {
+    [private] _public_key: fs::Buffer;
+    [private] _secret_key: fs::Buffer;
+
+    constructor(public_key: fs::Buffer, secret_key: fs::Buffer) {
+        this._public_key = public_key;
+        this._secret_key = secret_key;
+    }
+
+    /// Returns the public key. Share this for signature verification.
+    fn public_key() => fs::Buffer {
+        return this._public_key;
+    }
+
+    /// Returns the secret key. Never share this.
+    fn secret_key() => fs::Buffer {
+        return this._secret_key;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- X25519 box encryption ---
+// Encrypts messages between two parties using their key pairs.
+// Provides confidentiality and mutual authentication.
+// ---------------------------------------------------------------------------
+
+/// Generates a new random X25519 key pair.
+/// Returns None on failure.
+///
+/// @example {
+/// alice := crypto::asymmetric::box_keypair()?;
+/// bob   := crypto::asymmetric::box_keypair()?;
+/// }
+fn box_keypair() => BoxKeyPair? {
+    pk: Pointer<void> = null;
+    sk: Pointer<void> = null;
+
+    result := extern::peko_box_keypair(&pk, &sk);
+    if result != 0 {
+        return None;
+    }
+
+    return BoxKeyPair(
+        fs::Buffer(pk, 32, 32),
+        fs::Buffer(sk, 32, 32)
+    );
+}
+
+/// Generates a random 24-byte nonce for box encryption.
+/// A new nonce must be generated for every message with the same key pair.
+/// The nonce does not need to be secret - send it alongside the ciphertext.
+fn box_nonce() => fs::Buffer? {
+    n := extern::peko_box_nonce();
+    if n == null {
+        return None;
+    }
+    return fs::Buffer(n, 24, 24);
+}
+
+/// Encrypts a message from sender to recipient using X25519 + XSalsa20-Poly1305.
+/// The ciphertext is 16 bytes longer than the plaintext.
+/// Returns None on failure.
+///
+/// @param plaintext the message to encrypt
+/// @param nonce a fresh nonce from box_nonce
+/// @param recipient_pk the recipient's public key
+/// @param sender_sk the sender's secret key
+///
+/// @example {
+/// nonce := crypto::asymmetric::box_nonce()?;
+/// ct    := crypto::asymmetric::box_encrypt(message, nonce, bob.public_key(), alice.secret_key())?;
+/// }
+fn box_encrypt(plaintext: fs::Buffer, nonce: fs::Buffer, recipient_pk: fs::Buffer, sender_sk: fs::Buffer) => fs::Buffer? {
+    out_len := 0;
+    result  := extern::peko_box_encrypt(
+        plaintext.as_raw(), plaintext.len(),
+        nonce.as_raw(),
+        recipient_pk.as_raw(),
+        sender_sk.as_raw(),
+        &out_len
+    );
+    if result == null {
+        return None;
+    }
+    return fs::Buffer(result, out_len, out_len);
+}
+
+/// Decrypts a message from sender using X25519 + XSalsa20-Poly1305.
+/// Returns None if authentication fails or on error.
+///
+/// @param ciphertext the message to decrypt
+/// @param nonce the nonce used during encryption
+/// @param sender_pk the sender's public key
+/// @param recipient_sk the recipient's secret key
+///
+/// @example {
+/// pt := crypto::asymmetric::box_decrypt(ct, nonce, alice.public_key(), bob.secret_key())?;
+/// }
+fn box_decrypt(ciphertext: fs::Buffer, nonce: fs::Buffer, sender_pk: fs::Buffer, recipient_sk: fs::Buffer) => fs::Buffer? {
+    out_len := 0;
+    result  := extern::peko_box_decrypt(
+        ciphertext.as_raw(), ciphertext.len(),
+        nonce.as_raw(),
+        sender_pk.as_raw(),
+        recipient_sk.as_raw(),
+        &out_len
+    );
+    if result == null {
+        return None;
+    }
+    return fs::Buffer(result, out_len, out_len);
+}
+
+// ---------------------------------------------------------------------------
+// --- Ed25519 digital signatures ---
+// Signs messages to prove authenticity and detect tampering.
+// ---------------------------------------------------------------------------
+
+/// Generates a new random Ed25519 key pair for signing.
+/// Returns None on failure.
+///
+/// @example {
+/// keypair := crypto::asymmetric::sign_keypair()?;
+/// sig     := crypto::asymmetric::sign(message, keypair.secret_key())?;
+/// }
+fn sign_keypair() => SignKeyPair? {
+    pk: Pointer<void> = null;
+    sk: Pointer<void> = null;
+
+    result := extern::peko_sign_keypair(&pk, &sk);
+    if result != 0 {
+        return None;
+    }
+
+    return SignKeyPair(
+        fs::Buffer(pk, 32, 32),
+        fs::Buffer(sk, 64, 64)
+    );
+}
+
+/// Signs a message with the provided Ed25519 secret key.
+/// Returns a 64-byte signature Buffer, or None on failure.
+///
+/// @param message the message to sign
+/// @param secret_key the signer's secret key
+///
+/// @example {
+/// sig := crypto::asymmetric::sign(message, keypair.secret_key())?;
+/// }
+fn sign(message: fs::Buffer, secret_key: fs::Buffer) => fs::Buffer? {
+    out_len := 0;
+    result  := extern::peko_sign(message.as_raw(), message.len(), secret_key.as_raw(), &out_len);
+    if result == null {
+        return None;
+    }
+    return fs::Buffer(result, out_len, out_len);
+}
+
+/// Verifies an Ed25519 signature against a message using the signer's public key.
+/// Returns true if the signature is valid.
+///
+/// @param signature the signature to check
+/// @param message the message the signature should cover
+/// @param public_key the signer's public key
+///
+/// @example {
+/// valid := crypto::asymmetric::verify(sig, message, keypair.public_key());
+/// }
+fn verify(signature: fs::Buffer, message: fs::Buffer, public_key: fs::Buffer) => bool {
+    return extern::peko_sign_verify(
+        signature.as_raw(), signature.len(),
+        message.as_raw(), message.len(),
+        public_key.as_raw()
+    ) == 1;
+}
+
+
+
+[external] fn peko_pwhash_salt() => Pointer<void>;
+[external] fn peko_pwhash(password: cstr, password_len: int, salt: Pointer<void>, key_len: int, ops_limit: int, mem_limit: int) => Pointer<void>;
+[external] fn peko_pwhash_str(password: cstr, password_len: int, ops_limit: int, mem_limit: int) => string;
+[external] fn peko_pwhash_verify(hash_str: cstr, password: cstr, password_len: int) => int;
+
+// ---------------------------------------------------------------------------
+// --- OpsLimit mock-enum ---
+// Controls the CPU cost of Argon2id. Higher values are slower but more secure.
+// ---------------------------------------------------------------------------
+
+/// Preset CPU cost levels for Argon2id.
+/// Use Interactive for login forms. Use Sensitive for key storage.
+module OpsLimit {
+    /// Low CPU cost. Use for login forms.
+    Interactive: int = 2;
+    /// Medium CPU cost.
+    Moderate:    int = 3;
+    /// High CPU cost. Use for key storage.
+    Sensitive:   int = 4;
+}
+
+// ---------------------------------------------------------------------------
+// --- MemLimit mock-enum ---
+// Controls the memory cost of Argon2id in bytes.
+// ---------------------------------------------------------------------------
+
+/// Preset memory cost levels for Argon2id.
+/// Use Interactive for login forms. Use Sensitive for key storage.
+module MemLimit {
+    /// Low memory cost (64 MB). Use for login forms.
+    Interactive: int = 67108864;
+    /// Medium memory cost (256 MB).
+    Moderate:    int = 268435456;
+    /// High memory cost (1 GB). Use for key storage.
+    Sensitive:   int = 1073741824;
+}
+
+// ---------------------------------------------------------------------------
+// --- Salt generation ---
+// ---------------------------------------------------------------------------
+
+/// Generates a random 16-byte Argon2id salt.
+/// Always generate a fresh salt for each password. Never reuse salts.
+/// Store the salt alongside the hash or derived key.
+///
+/// @example {
+/// salt   := crypto::kdf::generate_salt()?;
+/// hashed := crypto::kdf::hash_password(password, salt)?;
+/// }
+fn generate_salt() => fs::Buffer? {
+    salt := extern::peko_pwhash_salt();
+    if salt == null {
+        return None;
+    }
+    return fs::Buffer(salt, 16, 16);
+}
+
+// ---------------------------------------------------------------------------
+// --- Key derivation ---
+// ---------------------------------------------------------------------------
+
+/// Derives a key of key_len bytes from password and salt using Argon2id.
+/// Use this to derive encryption keys from passwords.
+/// Use OpsLimit and MemLimit constants for the cost settings.
+/// The salt must come from generate_salt and be stored securely.
+/// Use a new salt for each password.
+/// Returns None on failure or if the system runs out of memory.
+///
+/// @param password the password to derive from
+/// @param salt the salt from generate_salt
+/// @param key_len the output key length in bytes
+/// @param ops_limit the CPU cost from the OpsLimit module
+/// @param mem_limit the memory cost from the MemLimit module
+///
+/// @example {
+/// salt := crypto::kdf::generate_salt()?;
+/// key  := crypto::kdf::derive_key(password, salt, 32, OpsLimit::Interactive, MemLimit::Interactive)?;
+/// }
+fn derive_key(password: string, salt: fs::Buffer, key_len: int, ops_limit: int, mem_limit: int) => fs::Buffer? {
+    result := extern::peko_pwhash(
+        password,
+        Runtime::length(password),
+        salt.as_raw(),
+        key_len,
+        ops_limit,
+        mem_limit
+    );
+    if result == null {
+        return None;
+    }
+    return fs::Buffer(result, key_len, key_len);
+}
+
+/// Derives a key with interactive cost presets.
+/// Suitable for login forms and interactive authentication.
+///
+/// @param password the password to derive from
+/// @param salt the salt from generate_salt
+/// @param key_len the output key length in bytes
+fn derive_key(password: string, salt: fs::Buffer, key_len: int) => fs::Buffer? {
+    return derive_key(password, salt, key_len, OpsLimit::Interactive, MemLimit::Interactive);
+}
+
+// ---------------------------------------------------------------------------
+// --- Password hashing for storage ---
+// ---------------------------------------------------------------------------
+
+/// Hashes a password into a self-contained string that includes the salt
+/// and Argon2id parameters. Use this for storing passwords in a database.
+/// The hash string is safe to store as-is.
+/// Use OpsLimit and MemLimit constants for the cost settings.
+/// Returns None on failure.
+///
+/// @param password the password to hash
+/// @param ops_limit the CPU cost from the OpsLimit module
+/// @param mem_limit the memory cost from the MemLimit module
+///
+/// @example {
+/// hash := crypto::kdf::hash_password(password, OpsLimit::Interactive, MemLimit::Interactive)?;
+/// // store hash in database
+/// }
+fn hash_password(password: string, ops_limit: int, mem_limit: int) => string? {
+    return extern::peko_pwhash_str(
+        password,
+        Runtime::length(password),
+        ops_limit,
+        mem_limit
+    );
+}
+
+/// Hashes a password with interactive cost presets.
+/// Suitable for most login and registration flows.
+///
+/// @param password the password to hash
+fn hash_password(password: string) => string? {
+    return hash_password(password, OpsLimit::Interactive, MemLimit::Interactive);
+}
+
+/// Verifies a password against a hash string produced by hash_password.
+/// Returns true if the password is correct.
+/// This function is constant-time to prevent timing attacks.
+///
+/// @param hash_str the stored hash string from hash_password
+/// @param password the password to check
+///
+/// @example {
+/// valid := crypto::kdf::verify_password(stored_hash, input_password);
+/// if !valid {
+///     return HttpResponse("Invalid password", 401);
+/// }
+/// }
+fn verify_password(hash_str: string, password: string) => bool {
+    return extern::peko_pwhash_verify(hash_str, password, Runtime::length(password)) == 1;
+}
+
+
+
+// Legacy MD5 and SHA-1 implementations are now consolidated in
+// peko_crypto_legacy, linked alongside peko_crypto.
+
+platform android {
+    link libs::android::peko_crypto_legacy as object;
+}
+
+platform ios {
+    arch arm {
+        link libs::ios::arm::peko_crypto_legacy as object;
+    }
+    arch x86_64 {
+        link libs::ios::x86_64::peko_crypto_legacy as object;
+    }
+}
+
+platform windows {
+    link libs::windows::peko_crypto_legacy as object;
+}
+
+platform linux {
+    arch arm {
+        link libs::linux::arm::peko_crypto_legacy as object;
+    }
+    arch x86_64 {
+        link libs::linux::x86_64::peko_crypto_legacy as object;
+    }
+}
+
+platform macos {
+    arch arm {
+        link libs::macos::arm::peko_crypto_legacy as object;
+    }
+    arch x86_64 {
+        link libs::macos::x86_64::peko_crypto_legacy as object;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- Legacy C externs ---
+// MD5 and SHA-1 are cryptographically broken. Use sha256 or blake2b instead.
+// These are provided only for compatibility with existing systems.
+// ---------------------------------------------------------------------------
+
+[external] fn md5_context_allocate() => opaque;
+[external] fn md5_init_binded(ctx: opaque);
+[external] fn md5_update_binded(ctx: opaque, data: Pointer<void>, len: int);
+[external] fn md5_final_binded(ctx: opaque, hash: Pointer<void>);
+
+[external] fn sha1_context_allocate() => opaque;
+[external] fn sha1_init_binded(ctx: opaque);
+[external] fn sha1_update_binded(ctx: opaque, data: Pointer<void>, len: int);
+[external] fn sha1_final_binded(ctx: opaque, hash: Pointer<void>);
+
+// ---------------------------------------------------------------------------
+// --- MD5 ---
+// WARNING: MD5 is cryptographically broken. Use it only for compatibility.
+// ---------------------------------------------------------------------------
+
+/// Computes an MD5 hash of the provided Buffer.
+/// Returns a 16-byte Buffer.
+///
+/// WARNING: MD5 is cryptographically broken. Use sha256 or blake2b instead.
+///
+/// @param data the Buffer to hash
+fn md5(data: fs::Buffer) => fs::Buffer {
+    ctx := extern::md5_context_allocate();
+
+    extern::md5_init_binded(ctx);
+    extern::md5_update_binded(ctx, data.as_raw(), data.len());
+
+    hash_buf := Runtime::Allocate<char>(16);
+    extern::md5_final_binded(ctx, hash_buf);
+
+    return fs::Buffer(hash_buf, 16, 16);
+}
+
+/// Streaming MD5 hasher.
+///
+/// WARNING: MD5 is cryptographically broken. Use Sha256Hasher or Blake2bHasher instead.
+class Md5Hasher {
+    [private] ctx: opaque;
+
+    constructor() {
+        this.ctx = extern::md5_context_allocate();
+        extern::md5_init_binded(this.ctx);
+    }
+
+    /// Feeds more data into the hasher.
+    ///
+    /// @param data the Buffer to add
+    fn update(data: fs::Buffer) {
+        extern::md5_update_binded(this.ctx, data.as_raw(), data.len());
+    }
+
+    /// Finalizes and returns a 16-byte MD5 digest Buffer.
+    fn finalize() => fs::Buffer {
+        hash_buf := Runtime::Allocate<char>(16);
+        extern::md5_final_binded(this.ctx, hash_buf);
+        return fs::Buffer(hash_buf, 16, 16);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- SHA-1 ---
+// WARNING: SHA-1 is cryptographically broken. Use it only for compatibility.
+// ---------------------------------------------------------------------------
+
+/// Computes a SHA-1 hash of the provided Buffer.
+/// Returns a 20-byte Buffer.
+///
+/// WARNING: SHA-1 is cryptographically broken. Use sha256 or blake2b instead.
+///
+/// @param data the Buffer to hash
+fn sha1(data: fs::Buffer) => fs::Buffer {
+    ctx := extern::sha1_context_allocate();
+
+    extern::sha1_init_binded(ctx);
+    extern::sha1_update_binded(ctx, data.as_raw(), data.len());
+
+    hash_buf := Runtime::Allocate<char>(20);
+    extern::sha1_final_binded(ctx, hash_buf);
+
+    return fs::Buffer(hash_buf, 20, 20);
+}
+
+/// Streaming SHA-1 hasher.
+///
+/// WARNING: SHA-1 is cryptographically broken. Use Sha256Hasher or Blake2bHasher instead.
+class Sha1Hasher {
+    [private] ctx: opaque;
+
+    constructor() {
+        this.ctx = extern::sha1_context_allocate();
+        extern::sha1_init_binded(this.ctx);
+    }
+
+    /// Feeds more data into the hasher.
+    ///
+    /// @param data the Buffer to add
+    fn update(data: fs::Buffer) {
+        extern::sha1_update_binded(this.ctx, data.as_raw(), data.len());
+    }
+
+    /// Finalizes and returns a 20-byte SHA-1 digest Buffer.
+    fn finalize() => fs::Buffer {
+        hash_buf := Runtime::Allocate<char>(20);
+        extern::sha1_final_binded(this.ctx, hash_buf);
+        return fs::Buffer(hash_buf, 20, 20);
+    }
+}

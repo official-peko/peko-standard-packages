@@ -1,0 +1,29 @@
+//! Implements common C FFI functionality for Pekoscript
+//! Note: all the functions declared and defined in this module will actually be under the 'extern' module
+
+[external variadic] fn sprintf(src: cstr, fmt: cstr) => int;
+[external] fn strcmp(str1: cstr, str2: cstr) => int;
+[external] fn fprintf(file: opaque, str: cstr) => int;
+[external variadic] fn fscanf(file: opaque, fmt: cstr) => int64;
+[external] fn getchar() => char;
+[external] fn fopen(path: cstr, func: cstr) => opaque;
+[external] fn fclose(file: opaque);
+[external] fn fgetc(file: opaque) => char;
+[external] fn mkdir(dir: cstr) => int64;
+[external] fn exit(code: int);
+
+platform macos|linux|android|ios {
+    [external] fn usleep(milli_seconds: int) => int;
+    [external] fn sleep(ms: int) => int {
+        return extern::usleep(ms);
+    }
+}
+
+platform windows {
+    [external] fn Sleep(milli_seconds: int) => int;
+    [external] fn sleep(ms: int) => int {
+        return extern::Sleep(ms);
+    }
+}
+
+[external] fn malloc(size: int64) => opaque;

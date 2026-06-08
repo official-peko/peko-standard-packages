@@ -1,0 +1,9 @@
+{
+  "name": "storage",
+  "label": "Cross Platform Persistent Storage Package",
+  "description": "Implements both secure and general application data storage.",
+  "latest": "v0.1.0",
+  "versions": [
+    "v0.1.0"
+  ]
+}

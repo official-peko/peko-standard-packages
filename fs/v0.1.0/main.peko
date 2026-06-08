@@ -1,0 +1,893 @@
+//! Implements filesystem input and output for Pekoscript.
+//! Provides file handles with cursors, buffered I/O, binary buffers,
+//! directory traversal, and convenience helpers.
+
+platform android {
+    link libs::android::peko_fs as object;
+}
+
+platform ios {
+    arch x86_64 {
+        link libs::ios::x86_64::peko_fs as object;
+    }
+
+    arch arm {
+        link libs::ios::arm::peko_fs as object;
+    }
+}
+
+platform windows {
+    link libs::windows::peko_fs as object;
+}
+
+platform linux {
+    arch x86_64 {
+        link libs::linux::x86_64::peko_fs as object;
+    }
+
+    arch arm {
+        link libs::linux::arm::peko_fs as object;
+    }
+}
+
+platform macos {
+    arch x86_64 {
+        link libs::macos::x86_64::peko_fs as object;
+    }
+
+    arch arm {
+        link libs::macos::arm::peko_fs as object;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- C extern declarations ---
+// ---------------------------------------------------------------------------
+
+[external] fn fs_exists(fpath: cstr) => bool;
+[external] fn fs_get_mode(fpath: cstr) => int;
+[external] fn fs_is_directory(fpath: cstr) => bool;
+[external] fn fs_is_regular(fpath: cstr) => bool;
+[external] fn fs_is_link(fpath: cstr) => bool;
+[external] fn fs_is_block(fpath: cstr) => bool;
+[external] fn fs_chmod(fpath: cstr, mode: int) => bool;
+
+[external] fn fs_open_handle(fpath: cstr, mode: int) => opaque;
+[external] fn fs_close_handle(handle: opaque);
+[external] fn fs_read_bytes(handle: opaque, n: int, out_len: &int) => Pointer<void>;
+[external] fn fs_read_string(handle: opaque, n: int) => string;
+[external] fn fs_read_all_string(handle: opaque) => string;
+[external] fn fs_read_all_bytes(handle: opaque, out_len: &int) => Pointer<void>;
+[external] fn fs_write_bytes(handle: opaque, buf: Pointer<void>, n: int) => int;
+[external] fn fs_write_string(handle: opaque, text: cstr) => int;
+[external] fn fs_seek(handle: opaque, offset: int, origin: int) => int;
+[external] fn fs_tell(handle: opaque) => int;
+[external] fn fs_flush(handle: opaque) => int;
+
+[external] fn fs_mkdir(dirpath: cstr) => bool;
+[external] fn fs_remove(fpath: cstr) => bool;
+[external] fn fs_copy(src: cstr, dst: cstr) => bool;
+[external] fn fs_move(src: cstr, dst: cstr) => bool;
+
+[external] fn fs_child_count(dirpath: cstr) => int;
+[external] fn fs_list_children(dirpath: cstr) => string[];
+[external] fn fs_walk(dirpath: cstr, max_depth: int, out_count: &int) => string[];
+
+[external] fn fs_helper_read_file(fpath: cstr) => string;
+[external] fn fs_helper_write_file(fpath: cstr, text: cstr) => bool;
+[external] fn fs_helper_append_file(fpath: cstr, text: cstr) => bool;
+[external] fn fs_helper_read_bytes(fpath: cstr, out_len: &int) => Pointer<void>;
+[external] fn fs_helper_copy(src: cstr, dst: cstr) => bool;
+[external] fn fs_helper_move(src: cstr, dst: cstr) => bool;
+
+[external] fn fs_content_changed(fpath: cstr, snapshot: cstr, snapshot_len: int) => bool;
+
+// ---------------------------------------------------------------------------
+// --- FileTypes mock-enum ---
+// ---------------------------------------------------------------------------
+
+/// File type ids returned by File::get_file_type.
+module FileTypes {
+    /// The file type could not be determined.
+    Unknown:   int = -1;
+    /// A directory.
+    Directory: int = 0;
+    /// A regular file.
+    Regular:   int = 1;
+    /// A symbolic link.
+    Link:      int = 2;
+    /// A block device.
+    Block:     int = 3;
+}
+
+// ---------------------------------------------------------------------------
+// --- OpenMode mock-enum ---
+// ---------------------------------------------------------------------------
+
+/// File open modes.
+/// Combine modes by passing an array to File::open.
+module OpenMode {
+    /// Open the file for reading.
+    Read:      int = 1;
+    /// Open the file for writing.
+    Write:     int = 2;
+    /// Append writes to the end of the file.
+    Append:    int = 4;
+    /// Open the file in binary mode.
+    Binary:    int = 8;
+    /// Open the file for both reading and writing.
+    ReadWrite: int = 16;
+}
+
+// ---------------------------------------------------------------------------
+// --- SeekFrom mock-enum ---
+// ---------------------------------------------------------------------------
+
+/// Origins for FileHandle::seek.
+module SeekFrom {
+    /// Seek from the start of the file.
+    Start:   int = 0;
+    /// Seek from the current cursor position.
+    Current: int = 1;
+    /// Seek from the end of the file.
+    End:     int = 2;
+}
+
+// Forward declaration of recursive_remove, used in File::delete.
+[private] fn recursive_remove(parent: string, fpath: string);
+
+// ---------------------------------------------------------------------------
+// --- Buffer ---
+// ---------------------------------------------------------------------------
+
+/// Represents a binary-safe byte buffer.
+/// Supports both text and binary content by tracking length explicitly
+/// so that null bytes within the data are preserved correctly.
+class Buffer {
+    [private] data: Pointer<void>;
+    [private] length: int;
+    [private] capacity: int;
+
+    /// Creates a buffer wrapping the provided raw data and length.
+    /// Used internally by FileHandle when reading binary data.
+    ///
+    /// @param data the raw data pointer
+    /// @param length the number of valid bytes
+    /// @param capacity the allocated capacity in bytes
+    constructor(data: Pointer<void>, length: int, capacity: int) {
+        this.data = data;
+        this.length = length;
+        this.capacity = capacity;
+    }
+
+    /// Creates an empty buffer.
+    constructor() {
+        this.data = __rt_peko_alloc<char>(0);
+        this.length = 0;
+        this.capacity = 0;
+    }
+
+    /// Returns the number of bytes held in this buffer.
+    fn len() => int {
+        return this.length;
+    }
+
+    /// Returns true if this buffer contains no bytes.
+    fn is_empty() => bool {
+        return this.length == 0;
+    }
+
+    /// Returns the raw data pointer.
+    /// Use with care. The length must be tracked separately.
+    fn as_raw() => Pointer<void> {
+        return this.data;
+    }
+
+    /// Returns the buffer contents as a string.
+    /// If the buffer contains null bytes this will be truncated at the
+    /// first null byte. Use as_raw() and len() for true binary data.
+    fn to_string() => string {
+        return this.data as string;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- FileHandle ---
+// ---------------------------------------------------------------------------
+
+/// A live file handle with cursor-based read/write operations.
+/// Obtain one via File::open() rather than constructing directly.
+class FileHandle {
+    [private] handle: opaque;
+    [private] mode:   int;
+    [private] open:   bool;
+
+    /// Internal constructor. Use File::open() instead.
+    [private] constructor(handle: opaque, mode: int) {
+        this.handle = handle;
+        this.mode   = mode;
+        this.open   = true;
+    }
+
+    /// Returns true if this handle is still open.
+    fn is_open() => bool {
+        return this.open;
+    }
+
+    /// Reads up to n bytes from the current cursor position.
+    /// Returns None if the handle is closed, at EOF, or on error.
+    ///
+    /// @param n the maximum number of bytes to read
+    fn read(n: int) => Buffer? {
+        if !this.open {
+            return None;
+        }
+
+        out_len := 0;
+        data    := extern::fs_read_bytes(this.handle, n, &out_len);
+
+        if out_len == 0 {
+            return None;
+        }
+
+        return Buffer(data, out_len, out_len);
+    }
+
+    /// Reads up to n bytes from the current cursor position as a string.
+    /// Returns None if the handle is closed, at EOF, or on error.
+    ///
+    /// @param n the maximum number of bytes to read
+    fn read_to_string(n: int) => string? {
+        if !this.open {
+            return None;
+        }
+
+        result := extern::fs_read_string(this.handle, n);
+
+        if result == "" {
+            return None;
+        }
+
+        return result;
+    }
+
+    /// Reads the entire remaining contents of the file as a Buffer.
+    /// Returns None on error.
+    fn read_all() => Buffer? {
+        if !this.open {
+            return None;
+        }
+
+        out_len := 0;
+        data    := extern::fs_read_all_bytes(this.handle, &out_len);
+
+        if out_len == 0 {
+            return None;
+        }
+
+        return Buffer(data, out_len, out_len);
+    }
+
+    /// Reads the entire remaining contents of the file as a string.
+    /// Returns None on error.
+    fn read_all_to_string() => string? {
+        if !this.open {
+            return None;
+        }
+
+        result := extern::fs_read_all_string(this.handle);
+
+        if result == "" {
+            return None;
+        }
+
+        return result;
+    }
+
+    /// Writes the provided buffer to the file at the current cursor position.
+    /// Returns the number of bytes written, or None on error.
+    ///
+    /// @param buf the buffer to write
+    fn write(buf: Buffer) => int? {
+        if !this.open {
+            return None;
+        }
+
+        result := extern::fs_write_bytes(this.handle, buf.as_raw(), buf.len());
+
+        if result < 0 {
+            return None;
+        }
+
+        return result;
+    }
+
+    /// Writes the provided string to the file at the current cursor position.
+    /// Returns the number of bytes written, or None on error.
+    ///
+    /// @param text the string to write
+    fn write_string(text: string) => int? {
+        if !this.open {
+            return None;
+        }
+
+        result := extern::fs_write_string(this.handle, text);
+
+        if result < 0 {
+            return None;
+        }
+
+        return result;
+    }
+
+    /// Moves the cursor to offset bytes from the provided SeekFrom origin.
+    /// Returns true on success.
+    ///
+    /// @param offset the byte offset to move to
+    /// @param origin the SeekFrom origin to measure from
+    fn seek(offset: int, origin: int) => bool {
+        if !this.open {
+            return false;
+        }
+
+        return extern::fs_seek(this.handle, offset, origin) == 0;
+    }
+
+    /// Returns the current byte offset of the cursor within the file.
+    /// Returns None on error.
+    fn tell() => int? {
+        if !this.open {
+            return None;
+        }
+
+        pos := extern::fs_tell(this.handle);
+
+        if pos < 0 {
+            return None;
+        }
+
+        return pos;
+    }
+
+    /// Flushes any pending buffered writes to the OS.
+    /// Returns true on success.
+    fn flush() => bool {
+        if !this.open {
+            return false;
+        }
+
+        return extern::fs_flush(this.handle) == 0;
+    }
+
+    /// Closes this file handle. Further operations will return None.
+    fn close() {
+        if this.open {
+            extern::fs_close_handle(this.handle);
+            this.open = false;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- BufReader ---
+// ---------------------------------------------------------------------------
+
+/// A buffered file reader that reads ahead in chunks to reduce syscall overhead.
+/// Construct one by wrapping an open FileHandle.
+class BufReader {
+    [private] handle:      FileHandle;
+    [private] buf:         string;
+    [private] buf_pos:     int;
+    [private] buf_len:     int;
+    [private] chunk_size:  int;
+
+    /// Creates a buffered reader wrapping the provided handle.
+    ///
+    /// @param handle the open file handle to read from
+    /// @param chunk_size how many bytes to read ahead at a time
+    constructor(handle: FileHandle, chunk_size: int) {
+        this.handle     = handle;
+        this.buf        = "";
+        this.buf_pos    = 0;
+        this.buf_len    = 0;
+        this.chunk_size = chunk_size;
+    }
+
+    /// Creates a buffered reader with the default chunk size (8 KB).
+    ///
+    /// @param handle the open file handle to read from
+    constructor(handle: FileHandle) {
+        this.handle     = handle;
+        this.buf        = "";
+        this.buf_pos    = 0;
+        this.buf_len    = 0;
+        this.chunk_size = 8192;
+    }
+
+    /// Reads the next line from the file, not including the newline character.
+    /// Returns None at end of file.
+    fn read_line() => string? {
+        line := String("");
+
+        while true {
+            // Refill the buffer if exhausted.
+            if this.buf_pos >= this.buf_len {
+                chunk := this.handle.read_to_string(this.chunk_size);
+
+                if !chunk.is_value() {
+                    if line.length() > 0 {
+                        return line as string;
+                    }
+                    return None;
+                }
+
+                this.buf     = chunk?;
+                this.buf_pos = 0;
+                this.buf_len = Runtime::length(this.buf);
+            }
+
+            ch := this.buf[this.buf_pos];
+            this.buf_pos += 1;
+
+            if ch == '\n' {
+                return line as string;
+            }
+
+            // Strip carriage returns for cross-platform line endings.
+            if ch != '\r' {
+                line.push(ch);
+            }
+        }
+
+        return None;
+    }
+
+    /// Reads the entire remaining file contents as a string.
+    fn read_all() => string? {
+        return this.handle.read_all_to_string();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- BufWriter ---
+// ---------------------------------------------------------------------------
+
+/// A buffered file writer that accumulates writes in memory before flushing.
+/// Construct one by wrapping an open FileHandle.
+class BufWriter {
+    [private] handle:     FileHandle;
+    [private] buf:        String;
+    [private] buf_size:   int;
+    [private] chunk_size: int;
+
+    /// Creates a buffered writer wrapping the provided handle.
+    ///
+    /// @param handle the open file handle to write to
+    /// @param chunk_size how many bytes to accumulate before an automatic flush
+    constructor(handle: FileHandle, chunk_size: int) {
+        this.handle     = handle;
+        this.buf        = String("");
+        this.buf_size   = 0;
+        this.chunk_size = chunk_size;
+    }
+
+    /// Creates a buffered writer with the default chunk size (8 KB).
+    ///
+    /// @param handle the open file handle to write to
+    constructor(handle: FileHandle) {
+        this.handle     = handle;
+        this.buf        = String("");
+        this.buf_size   = 0;
+        this.chunk_size = 8192;
+    }
+
+    /// Writes a string to the buffer. Flushes automatically when the
+    /// buffer reaches the chunk size.
+    ///
+    /// @param text the string to add to the buffer
+    fn write(text: string) => bool {
+        this.buf.push(text);
+        this.buf_size += Runtime::length(text);
+
+        if this.buf_size >= this.chunk_size {
+            return this.flush();
+        }
+
+        return true;
+    }
+
+    /// Writes a string followed by a newline to the buffer.
+    ///
+    /// @param text the string to add, followed by a newline
+    fn write_line(text: string) => bool {
+        return this.write(`${text}\n`);
+    }
+
+    /// Flushes all buffered data to the file handle.
+    /// Returns true on success.
+    fn flush() => bool {
+        if this.buf_size == 0 {
+            return true;
+        }
+
+        result := this.handle.write_string(this.buf as string);
+
+        if !result.is_value() {
+            return false;
+        }
+
+        this.buf      = String("");
+        this.buf_size = 0;
+
+        return this.handle.flush();
+    }
+
+    /// Flushes and closes the underlying file handle.
+    fn close() {
+        this.flush();
+        this.handle.close();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- File ---
+// ---------------------------------------------------------------------------
+
+/// Represents a file path and its metadata.
+/// Lightweight. Holds no OS resources. Use open() to get a FileHandle.
+///
+/// @example {
+/// f := File("/tmp/notes.txt");
+/// if f.exists() {
+///     handle := f.open(OpenMode::Read)?;
+/// }
+/// }
+class File {
+    [private] file_path: string;
+    [private] file_exists: bool;
+    [private] file_type: int;
+    [private] file_mode: int;
+
+    /// Creates a File for the provided path and reads its metadata.
+    ///
+    /// @param file_path the path this File points to
+    constructor(file_path: string) {
+        this.file_path   = file_path;
+        this.file_exists = extern::fs_exists(file_path);
+        this.file_type   = FileTypes::Unknown;
+        this.file_mode   = -1;
+
+        if !this.file_exists {
+            return;
+        }
+
+        if extern::fs_is_directory(this.file_path) {
+            this.file_type = FileTypes::Directory;
+        } else if extern::fs_is_regular(this.file_path) {
+            this.file_type = FileTypes::Regular;
+        } else if extern::fs_is_link(this.file_path) {
+            this.file_type = FileTypes::Link;
+        } else if extern::fs_is_block(this.file_path) {
+            this.file_type = FileTypes::Block;
+        }
+
+        this.file_mode = extern::fs_get_mode(this.file_path);
+    }
+
+    /// Returns the full path this File points to.
+    fn path() => string {
+        return this.file_path;
+    }
+
+    /// Returns just the file name portion of the path.
+    ///
+    /// @example {
+    /// f := File("/tmp/test.txt");
+    /// console::println(f.name()) // prints 'test.txt'
+    /// }
+    fn name() => string {
+        parts := String(this.file_path).split('/');
+
+        if parts.back().is_value() {
+            return parts.back()?;
+        }
+
+        return "";
+    }
+
+    /// Returns the file extension, or an empty string if there is none.
+    fn extension() => string {
+        if !String(this.file_path).contains(".") {
+            return "";
+        }
+
+        return String(this.file_path).split(".").back()?;
+    }
+
+    /// Returns true if this file exists on the filesystem.
+    fn exists() => bool {
+        return this.file_exists;
+    }
+
+    /// Returns true if this File points to a directory.
+    fn is_dir() => bool {
+        return this.file_type == FileTypes::Directory;
+    }
+
+    /// Returns the FileTypes id for this file.
+    fn get_file_type() => int {
+        return this.file_type;
+    }
+
+    /// Returns the mode of this file.
+    fn mode() => int {
+        return this.file_mode;
+    }
+
+    /// Attempts to change the mode of this file.
+    /// Returns true on success.
+    ///
+    /// @param mode the new mode to set
+    fn set_mode(mode: int) => bool {
+        if !this.file_exists {
+            return false;
+        }
+
+        if extern::fs_chmod(this.file_path, mode) {
+            this.file_mode = mode;
+            return true;
+        }
+
+        return false;
+    }
+
+    /// Opens this file with a single mode and returns a FileHandle.
+    /// Returns None if the file cannot be opened.
+    ///
+    /// @param mode a single mode from the OpenMode module
+    ///
+    /// @example {
+    /// handle := File("/tmp/notes.txt").open(OpenMode::Read)?;
+    /// }
+    fn open(mode: int) => FileHandle? {
+        handle := extern::fs_open_handle(this.file_path, mode);
+
+        if handle == null {
+            return None;
+        }
+
+        return FileHandle(handle, mode);
+    }
+
+    /// Opens this file with a combination of modes and returns a FileHandle.
+    /// The modes are OR'd together from the OpenMode module.
+    /// Returns None if the file cannot be opened.
+    ///
+    /// @param modes the modes to combine from the OpenMode module
+    fn open(modes: Array<int>) => FileHandle? {
+        combined := 0;
+
+        for m in modes {
+            combined = combined + m;
+        }
+
+        return this.open(combined);
+    }
+
+    /// Deletes this file or directory from the filesystem.
+    fn delete() {
+        if this.file_exists {
+            recursive_remove("", this.file_path);
+            this.file_exists = false;
+        }
+    }
+
+    /// Returns true if the current on-disk contents differ from snapshot.
+    ///
+    /// @param snapshot the previously captured contents to compare against
+    fn content_changed(snapshot: string) => bool {
+        return extern::fs_content_changed(
+            this.file_path,
+            snapshot,
+            Runtime::length(snapshot)
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- Directory ---
+// ---------------------------------------------------------------------------
+
+/// Extends File with directory-specific operations.
+class Directory from File {
+
+    /// Returns how many direct children this directory has.
+    fn child_count() => int {
+        return extern::fs_child_count(this.file_path);
+    }
+
+    /// Returns the child File at index idx.
+    /// Returns None if idx is out of bounds.
+    ///
+    /// @param idx the index of the child to return
+    fn get_child(idx: int) => File? {
+        count := this.child_count();
+
+        if idx < 0 || idx >= count {
+            return None;
+        }
+
+        children := extern::fs_list_children(this.file_path);
+        return File(`${this.file_path}/${children[idx]}`);
+    }
+
+    /// Returns all direct children of this directory as File objects.
+    fn children() => Array<File> {
+        result   := Array<File>();
+        count    := this.child_count();
+        children := extern::fs_list_children(this.file_path);
+
+        for i in 0..count {
+            result.push(File(`${this.file_path}/${children[i]}`));
+        }
+
+        return result;
+    }
+
+    /// Recursively walks this directory and returns all descendant paths.
+    /// max_depth limits recursion depth. Pass -1 for unlimited depth.
+    ///
+    /// @param max_depth the deepest level to descend, or -1 for unlimited
+    ///
+    /// @example {
+    /// dir := Directory("/tmp/myproject");
+    /// for path in dir.walk(-1) {
+    ///     console::println(path);
+    /// }
+    /// }
+    fn walk(max_depth: int) => Array<string> {
+        out_count := 0;
+        paths     := extern::fs_walk(this.file_path, max_depth, &out_count);
+        result    := Array<string>();
+
+        for i in 0..out_count {
+            result.push(paths[i]);
+        }
+
+        return result;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- Internal helpers ---
+// ---------------------------------------------------------------------------
+
+/// Recursively removes the provided path and all its descendants.
+///
+/// @param parent the parent directory, or an empty string for none
+/// @param fpath the path to remove, relative to parent
+[private] fn recursive_remove(parent: string, fpath: string) {
+    full_path := "";
+
+    if parent == "" {
+        full_path = fpath;
+    } else if parent[Runtime::length(parent)-1] == '/' || parent[Runtime::length(parent)-1] == '\\' {
+        full_path = `${parent}${fpath}`;
+    } else {
+        full_path = `${parent}/${fpath}`;
+    }
+
+    if extern::fs_is_directory(full_path) {
+        children_count := extern::fs_child_count(full_path);
+        children_list  := extern::fs_list_children(full_path);
+
+        for i in 0..children_count {
+            recursive_remove(full_path, children_list[i]);
+        }
+    }
+
+    extern::fs_remove(full_path);
+}
+
+// ---------------------------------------------------------------------------
+// --- Convenience helpers ---
+// ---------------------------------------------------------------------------
+
+/// Attempts to create a new directory at the provided path.
+/// Returns false if the directory cannot be created.
+///
+/// @param dirpath the path of the directory to create
+fn mkdir(dirpath: string) => bool {
+    return extern::fs_mkdir(dirpath);
+}
+
+/// Creates a new empty file at the provided path.
+/// Returns false if the file cannot be created.
+///
+/// @param fpath the path of the file to create
+fn create(fpath: string) => bool {
+    return extern::fs_helper_write_file(fpath, "");
+}
+
+/// Returns true if the path exists on the filesystem.
+///
+/// @param fpath the path to check
+fn exists(fpath: string) => bool {
+    return extern::fs_exists(fpath);
+}
+
+
+/// Reads the entire contents of the file at fpath as a string.
+/// Returns None if the file cannot be read.
+///
+/// @param fpath the path of the file to read
+///
+/// @example {
+/// contents := fs::read_file("/tmp/notes.txt")?;
+/// }
+fn read_file(fpath: string) => string? {
+    if !exists(fpath) {
+        return None;
+    }
+    result := extern::fs_helper_read_file(fpath);
+    if result == null {
+        return None;
+    }
+
+    return result;
+}
+
+/// Writes text to the file at fpath, replacing any existing contents.
+/// Returns false on failure.
+///
+/// @param fpath the path of the file to write
+/// @param text the text to write
+///
+/// @example {
+/// fs::write_file("/tmp/notes.txt", "hello");
+/// }
+fn write_file(fpath: string, text: string) => bool {
+    return extern::fs_helper_write_file(fpath, text);
+}
+
+/// Appends text to the file at fpath.
+/// Returns false on failure.
+///
+/// @param fpath the path of the file to append to
+/// @param text the text to append
+fn append_file(fpath: string, text: string) => bool {
+    return extern::fs_helper_append_file(fpath, text);
+}
+
+/// Reads the entire contents of the file at fpath as a Buffer.
+/// Returns None if the file cannot be read.
+///
+/// @param fpath the path of the file to read
+fn read_bytes(fpath: string) => Buffer? {
+    out_len := 0;
+    data    := extern::fs_helper_read_bytes(fpath, &out_len);
+
+    if out_len == 0 {
+        return None;
+    }
+
+    return Buffer(data, out_len, out_len);
+}
+
+/// Copies the file at src to dst.
+/// Returns false on failure.
+///
+/// @param src the source path
+/// @param dst the destination path
+fn copy(src: string, dst: string) => bool {
+    return extern::fs_helper_copy(src, dst);
+}
+
+/// Moves the file at src to dst.
+/// Returns false on failure.
+///
+/// @param src the source path
+/// @param dst the destination path
+fn move(src: string, dst: string) => bool {
+    return extern::fs_helper_move(src, dst);
+}

@@ -1,0 +1,8 @@
+{
+  "webview": "v0.1.0",
+  "sockets": "v0.1.0",
+  "json": "v0.1.0",
+  "fs": "v0.1.0",
+  "threads": "v0.1.0",
+  "assets": "v0.1.0"
+}

@@ -1,0 +1,474 @@
+//! Implements JSON parsing and creating for Pekoscript.
+
+import lexer@"v0.1.0";
+
+/// Represents a base json value.
+/// Intended to be derived into more specific json value types.
+///
+/// @example {
+/// dataObject: JsonValue = JsonNumber(123);
+/// console::println(dataObject.get_type()) // prints 'number'
+/// console::println(dataObject.to_string()) // prints '123'
+/// }
+class JsonValue {
+    /// Creates a base JsonValue. Use a derived type instead.
+    constructor() {}
+
+    /// Converts this value to a string.
+    fn to_string() => String {
+        return "";
+    }
+
+    /// Returns the value type.
+    fn get_type() => String {
+        return "";
+    }
+
+    [operator to_string]() => string {
+        return to_string();
+    }
+}
+
+/// Represents a json map/object.
+class JsonObject from JsonValue {
+    [private] key_values: Map<String, JsonValue>;
+
+    /// Creates an empty JsonObject.
+    constructor() {
+        key_values = Map<String, JsonValue>();
+    }
+
+    /// Creates a JsonObject and populates it with the provided key-value pairs.
+    ///
+    /// @param key_values the Map to fill the JsonObject with
+    constructor(key_values: Map<String, JsonValue>) {
+        this.key_values = key_values;
+    }
+
+    /// Prints this json object into a string.
+    /// Does not pretty print.
+    fn to_string() => String {
+        final_string := String("{");
+
+        for key_value in key_values {
+            final_string.push("\"");
+            final_string.push(key_value.get_first());
+            final_string.push("\":");
+            final_string.push(key_value.get_second().to_string());
+            final_string.push(",");
+        }
+
+        if key_values.length() > 0 {
+            final_string.pop();
+        }
+
+        final_string.push("}");
+
+        return final_string;
+    }
+
+    /// Returns "object".
+    fn get_type() => String {
+        return "object";
+    }
+
+    /// Returns how many key-value pairs are in this object.
+    fn length() => int {
+        return this.key_values.length();
+    }
+
+    /// Returns true if the provided key exists in this object.
+    ///
+    /// @param key the key to check this object for
+    fn contains(key: String) => bool {
+        return this.key_values.contains(key);
+    }
+
+    /// Inserts the provided value at the key of this object.
+    /// If the key exists, this replaces the value.
+    /// If the key does not exist, this adds a new key.
+    ///
+    /// @param key the key to insert at
+    /// @param value the value to store
+    [mutates] fn insert(key: String, value: JsonValue) {
+        this.key_values.insert(key, value);
+    }
+
+    [operator []](index: String) => JsonValue? {
+        return key_values.get(index);
+    }
+
+    [mutates] [operator []=](index: String) => &JsonValue {
+        return &key_values[index];
+    }
+}
+
+/// Represents a json array value.
+class JsonArray from JsonValue {
+    [private] values: Array<JsonValue>;
+
+    /// Creates an empty JsonArray.
+    constructor() {
+        values = Array<JsonValue>();
+    }
+
+    /// Creates a JsonArray from the provided values.
+    ///
+    /// @param values the values to fill the array with
+    constructor(values: Array<JsonValue>) {
+        this.values = values;
+    }
+
+    [operator []](index: int) => JsonValue? {
+        return values[index];
+    }
+
+    [mutates] [operator []=](index: int) => &JsonValue {
+        return &values[index];
+    }
+
+    /// Appends a value to the end of this array.
+    ///
+    /// @param value the value to append
+    [mutates] fn push(value: JsonValue) {
+        values.push(value);
+    }
+
+    /// Prints this array into a string.
+    fn to_string() => String {
+        final_string := String("[");
+
+        for value in values {
+            final_string.push(value.to_string());
+            final_string.push(",");
+        }
+
+        if values.length() > 0 {
+            final_string.pop();
+        }
+
+        final_string.push("]");
+
+        return final_string;
+    }
+
+    /// Returns "array".
+    fn get_type() => String {
+        return "array";
+    }
+
+    /// Returns how many items are in this JSON array.
+    fn length() => int {
+        return values.length();
+    }
+}
+
+/// Represents a string value in JSON.
+class JsonString from JsonValue {
+    [private] string_value: String;
+
+    /// Creates an empty JsonString.
+    constructor() {
+        string_value = String();
+    }
+
+    /// Creates a JsonString holding the provided string.
+    ///
+    /// @param string_value the string to hold
+    constructor(string_value: String) {
+        this.string_value = string_value;
+    }
+
+    /// Returns the base string this object holds.
+    ///
+    /// @example {
+    /// name_value := JsonString("Joe");
+    /// console::println(name_value.get_string()) // prints 'Joe'
+    /// }
+    fn get_string() => String {
+        return this.string_value;
+    }
+
+    /// Returns how long this string is.
+    fn length() => int {
+        return this.string_value.length();
+    }
+
+    /// Prints this object to a string.
+    /// Note: this adds quotes around the value.
+    ///
+    /// @example {
+    /// name_value := JsonString("Joe");
+    /// console::println(name_value.to_string()) // prints '"Joe"'
+    /// }
+    fn to_string() => String {
+        escaped := this.string_value.cancel('"');
+        return String(`"${escaped}"`);
+    }
+
+    /// Returns "string".
+    fn get_type() => String {
+        return "string";
+    }
+}
+
+/// Represents a number value in JSON.
+class JsonNumber from JsonValue {
+    [private] number_value: float;
+
+    /// Creates a JsonNumber holding the provided number.
+    ///
+    /// @param number_value the number to hold
+    constructor(number_value: float) {
+        this.number_value = number_value;
+    }
+
+    /// Returns the underlying number of this value.
+    fn get_number() => float {
+        return this.number_value;
+    }
+
+    /// Returns this value as a string.
+    fn to_string() => String {
+        return String(Runtime::FloatToString(this.number_value));
+    }
+
+    /// Returns "number".
+    fn get_type() => String {
+        return "number";
+    }
+}
+
+/// Represents a boolean value in JSON.
+class JsonBoolean from JsonValue {
+    [private] bool_value: bool;
+
+    /// Creates a JsonBoolean holding the provided boolean.
+    ///
+    /// @param bool_value the boolean to hold
+    constructor(bool_value: bool) {
+        this.bool_value = bool_value;
+    }
+
+    /// Returns the underlying boolean of this value.
+    fn get_bool() => bool {
+        return this.bool_value;
+    }
+
+    /// Returns "true" when the value is true and "false" otherwise.
+    fn to_string() => String {
+        if this.bool_value {
+            return String("true");
+        }
+        return String("false");
+    }
+
+    /// Returns "boolean".
+    fn get_type() => String {
+        return "boolean";
+    }
+}
+
+/// Represents a null value in JSON.
+class JsonNull from JsonValue {
+    /// Creates a JsonNull.
+    constructor() {}
+
+    /// Returns "null".
+    fn to_string() => String {
+        return String("null");
+    }
+
+    /// Returns "null".
+    fn get_type() => String {
+        return "null";
+    }
+}
+
+/// Built-in private class for parsing JSON.
+[private] class JsonParser {
+    [private] json_tokens: Array<lexer::Token>;
+    [private] tokens_index: int;
+    [private] finished_tokens: bool;
+
+    /// Creates a new parser with the provided source.
+    /// Lexes the provided source automatically.
+    constructor(json_string: String) {
+        this.json_tokens = lexer::tokenize(json_string);
+        this.tokens_index = 0;
+        this.finished_tokens = false;
+    }
+
+    /// Creates a parser with the provided token list.
+    constructor(json_tokens: Array<lexer::Token>) {
+        this.json_tokens = json_tokens;
+        this.tokens_index = 0;
+        this.finished_tokens = false;
+    }
+
+    /// Advances the token index, skipping whitespace tokens.
+    [private mutates] fn increase_index() {
+        // skip any preceding whitespace
+        while this.json_tokens[tokens_index].get_type() == lexer::TokenType::Whitespace {
+            this.tokens_index = this.tokens_index + 1;
+            if this.tokens_index >= json_tokens.length() {
+                this.tokens_index = json_tokens.length() - 1;
+                finished_tokens = true;
+                return;
+            }
+        }
+
+        // advance the index
+        this.tokens_index = this.tokens_index + 1;
+
+        // handle reaching the end of the token list
+        if this.tokens_index >= json_tokens.length() {
+            this.tokens_index = json_tokens.length() - 1;
+            finished_tokens = true;
+            return;
+        }
+
+        // skip any following whitespace
+        while this.json_tokens[tokens_index].get_type() == lexer::TokenType::Whitespace {
+            this.tokens_index = this.tokens_index + 1;
+            if this.tokens_index >= json_tokens.length() {
+                this.tokens_index = json_tokens.length() - 1;
+                finished_tokens = true;
+                return;
+            }
+        }
+    }
+
+    /// Parses a string value from the current index.
+    [private mutates] fn parse_string() => JsonValue {
+        string_value := this.json_tokens[tokens_index].get_value();
+        increase_index();
+        return JsonString(string_value);
+    }
+
+    /// Parses a number value from the current index.
+    [private mutates] fn parse_number() => JsonValue {
+        number_value := this.json_tokens[tokens_index].get_value() as float;
+        increase_index();
+        return JsonNumber(number_value);
+    }
+
+    /// Parses a boolean value from the current index.
+    /// The current token is a "true" or "false" identifier.
+    [private mutates] fn parse_boolean() => JsonValue {
+        bool_value := this.json_tokens[tokens_index].value_equals("true");
+        increase_index();
+        return JsonBoolean(bool_value);
+    }
+
+    /// Parses a null value from the current index.
+    /// The current token is a "null" identifier.
+    [private mutates] fn parse_null() => JsonValue {
+        increase_index();
+        return JsonNull();
+    }
+
+    /// Parses an array from the current index.
+    /// Returns None if the closing bracket is not found.
+    [private mutates] fn parse_array() => JsonValue? {
+        values := Array<JsonValue>();
+
+        increase_index(); // eat the [
+
+        while !finished_tokens && !this.json_tokens[tokens_index].value_equals("]") {
+            values.push(this.parse_json()?);
+            if this.json_tokens[tokens_index].get_value() == "," {
+                increase_index();
+            }
+        }
+
+        if !this.json_tokens[tokens_index].value_equals("]") {
+            return Error("Expected ']' for Json array");
+        }
+        increase_index();
+
+        return JsonArray(values);
+    }
+
+    /// Parses a JSON object from the current index.
+    /// Returns None if the closing brace is not found or if a colon is missing.
+    [private mutates] fn parse_object() => JsonValue? {
+        keyvalues := Map<String, JsonValue>();
+
+        increase_index(); // eat the {
+
+        while !finished_tokens && !this.json_tokens[tokens_index].value_equals("}") {
+            // parse and eat the key
+            key := this.json_tokens[tokens_index].get_value();
+            increase_index();
+
+            // check for colon then eat it
+            if !this.json_tokens[tokens_index].value_equals(":") {
+                return Error("Expected ':' for Json key value pair");
+            }
+            increase_index();
+
+            // parse the value
+            value := this.parse_json();
+
+            // add the key value pair
+            keyvalues.insert(key, value?);
+
+            // eat the comma
+            if this.json_tokens[tokens_index].get_value() == "," {
+                increase_index();
+            }
+        }
+
+        if !this.json_tokens[tokens_index].value_equals("}") {
+            return Error("Expected '}' for Json object");
+        }
+        increase_index();
+
+        return JsonObject(keyvalues);
+    }
+
+    /// Parses one JSON value of any kind from the current index.
+    [mutates] fn parse_json() => JsonValue? {
+        if this.json_tokens[tokens_index].get_type() == lexer::TokenType::String {
+            return this.parse_string();
+        } else if this.json_tokens[tokens_index].value_equals("null") {
+            return this.parse_null();
+        } else if this.json_tokens[tokens_index].value_equals("true") || this.json_tokens[tokens_index].value_equals("false") {
+            return this.parse_boolean();
+        } else if this.json_tokens[tokens_index].get_type() == lexer::TokenType::Number {
+            return this.parse_number();
+        } else if this.json_tokens[tokens_index].value_equals("[") {
+            return this.parse_array();
+        } else if this.json_tokens[tokens_index].value_equals("{") {
+            return this.parse_object();
+        }
+
+        return Error(`Unexpected token ${this.json_tokens[tokens_index].get_value()}`);
+    }
+}
+
+/// Parses a JSON string into a JsonValue tree.
+///
+/// @param str the JSON text to parse
+///
+/// @example {
+/// person_info := json(`
+/// {
+///     "name": "Joe",
+///     "age": 42,
+///     "job": "Accountant",
+///     "active": true,
+///     "manager": null
+/// }
+/// `)? as JsonObject;
+///
+/// console::println(person_info["name"]?.to_string()); // prints '"Joe"'
+/// console::println(person_info["age"]?.to_string()); // prints '42'
+/// console::println(person_info["active"]?.get_type()); // prints 'boolean'
+/// console::println(person_info["manager"]?.get_type()); // prints 'null'
+/// console::println(person_info.contains("SSN")); // prints 'false'
+/// }
+fn json(str: String) => JsonValue? {
+    return JsonParser(str).parse_json();
+}

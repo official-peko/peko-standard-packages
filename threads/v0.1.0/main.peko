@@ -1,0 +1,634 @@
+//! Implements threading for Pekoscript.
+//! Provides threads, mutexes, futures, channels, cancellation, and scopes.
+
+platform android {
+    link libs::android::peko_threads as object;
+    link libs::android::peko_dispatch as object;
+}
+
+platform ios {
+    arch x86_64 {
+        link libs::ios::x86_64::peko_threads as object;
+        link libs::ios::x86_64::peko_dispatch as object;
+    }
+    arch arm {
+        link libs::ios::arm::peko_threads as object;
+        link libs::ios::arm::peko_dispatch as object;
+    }
+}
+
+platform windows {
+    link libs::windows::peko_threads as object;
+    link libs::windows::peko_dispatch as object;
+}
+
+platform linux {
+    arch x86_64 {
+        link libs::linux::x86_64::peko_threads as object;
+        link libs::linux::x86_64::peko_dispatch as object;
+    }
+    arch arm {
+        link libs::linux::arm::peko_threads as object;
+        link libs::linux::arm::peko_dispatch as object;
+    }
+}
+
+platform macos {
+    arch x86_64 {
+        link libs::macos::x86_64::peko_threads as object;
+        link libs::macos::x86_64::peko_dispatch as object;
+    }
+    arch arm {
+        link libs::macos::arm::peko_threads as object;
+        link libs::macos::arm::peko_dispatch as object;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- C extern declarations ---
+// ---------------------------------------------------------------------------
+
+// GC thread participation.
+[external notrack] fn pgc_thread_attach();
+[external notrack] fn pgc_thread_detach();
+[external gcsafe] fn pgc_begin_blocking();
+[external notrack] fn pgc_end_blocking();
+
+[external gcsafe] fn peko_thread_create(worker: (opaque)(Pointer<void>), data: Pointer<void>, synchronous: bool) => opaque;
+[external] fn peko_thread_kill(thread: opaque);
+[external gcsafe] fn peko_thread_free(thread: opaque);
+
+[external] fn peko_mutex_new() => opaque;
+[external] fn peko_mutex_free(m: opaque);
+[external] fn peko_mutex_init(m: opaque);
+[external] fn peko_mutex_destroy(m: opaque);
+[external] fn peko_mutex_lock(m: opaque);
+[external] fn peko_mutex_unlock(m: opaque);
+
+[external] fn peko_dispatch_main(worker: (opaque)(Pointer<void>), data: Pointer<void>);
+[external notrack] fn peko_sleep_ms(ms: int);
+
+// ---------------------------------------------------------------------------
+// --- Mutex ---
+// ---------------------------------------------------------------------------
+
+/// A mutual exclusion lock protecting a value of type T.
+/// Use lock() to access the value and release() when done.
+/// Always call release() after lock() to avoid deadlocks.
+///
+/// Mutex returns the protected value from lock(). For a reference type the
+/// returned value is the shared object and mutations through it are visible
+/// to other holders. For a plain value type the return is a copy, so use
+/// Mutex<T> for value types as a lock token and keep the guarded state
+/// elsewhere.
+///
+/// @example {
+/// shared := threads::Mutex<List<int>>(List<int>());
+///
+/// threads::new_thread(closure[shared]() {
+///     items := shared.lock();
+///     items.push(1);
+///     shared.release();
+/// });
+/// }
+class Mutex<T> {
+    // The protected value is a direct field. As a field of a managed class
+    // it is traced by the class descriptor: when T is a reference type the
+    // collector relocates it on a move. lock returns the value, so for a
+    // reference type the caller gets the live reference and mutates the
+    // shared object in place.
+    [private] data:   T;
+    [private] handle: opaque;
+
+    /// Creates a Mutex protecting the provided initial value.
+    ///
+    /// @param data the value to protect
+    constructor(data: T) {
+        this.data   = data;
+        // Allocate the OS mutex on the C heap (not the GC heap) so the
+        // collector cannot move it. A moved mutex would corrupt pthread
+        // internals.
+        this.handle = extern::peko_mutex_new();
+    }
+
+    /// Acquires the lock and returns the protected value. For a reference
+    /// type the returned reference is the shared object, so mutations
+    /// through it are visible to other holders. release() must be called
+    /// when the work is done.
+    fn lock() => T {
+        h := this.handle;
+        extern::pgc_begin_blocking();
+        extern::peko_mutex_lock(h);
+        extern::pgc_end_blocking();
+        return this.data;
+    }
+
+    /// Acquires the lock, passes the protected value to body, and releases
+    /// the lock after body returns. A return inside body ends body, and the
+    /// lock is still released.
+    fn with_lock(body: closure(T) => void) {
+        value := this.lock();
+        body(value);
+        this.release();
+    }
+
+    /// Releases the lock.
+    fn release() {
+        extern::peko_mutex_unlock(this.handle);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- Thread ---
+// ---------------------------------------------------------------------------
+
+/// Represents a system thread.
+///
+/// @example {
+/// t := threads::Thread(closure() {
+///     console::println("running on a thread");
+/// });
+/// t.start();
+/// }
+class Thread {
+    [private] threaded_function: closure() => opaque;
+    [private] cthread:           opaque;
+    [private] active:            bool;
+
+    /// Creates a new thread with the provided function.
+    ///
+    /// @param thread_func the function to run on the thread
+    constructor(thread_func: closure()) {
+        this.active  = false;
+        this.cthread = Default;
+        this.threaded_function = closure[thread_func]() => opaque {
+            thread_func();
+            return Default;
+        };
+    }
+
+    /// Sets the thread function.
+    ///
+    /// @param thread_func the function to run on the thread
+    [mutates] fn set_threaded_function(thread_func: closure()) {
+        this.threaded_function = closure[thread_func]() => opaque {
+            thread_func();
+            return Default;
+        };
+    }
+
+    /// Starts the thread in non-blocking mode.
+    fn start() {
+        this.cthread = extern::peko_thread_create(
+            this.threaded_function.function,
+            this.threaded_function.context,
+            false
+        );
+        this.active = true;
+    }
+
+    /// Starts the thread and blocks until it finishes.
+    fn start_blocking() {
+        this.active  = true;
+        this.cthread = extern::peko_thread_create(
+            this.threaded_function.function,
+            this.threaded_function.context,
+            true
+        );
+        this.active = false;
+    }
+
+    /// Returns true if this thread is active.
+    fn is_active() => bool {
+        return this.active;
+    }
+
+    /// Force-kills the thread.
+    ///
+    /// WARNING: this is unsafe. The thread may be stopped while holding
+    /// a lock or in the middle of an allocation, causing deadlocks or
+    /// memory corruption. Use CancelToken for safe cancellation instead.
+    fn kill() {
+        extern::peko_thread_kill(this.cthread);
+        extern::peko_thread_free(this.cthread);
+        this.active = false;
+    }
+}
+
+
+
+// ---------------------------------------------------------------------------
+// --- Convenience functions ---
+// ---------------------------------------------------------------------------
+
+/// Creates and starts a new thread with the provided function.
+///
+/// @example {
+/// threads::new_thread(closure() {
+///     console::println("hello from thread");
+/// });
+/// }
+///
+/// @param threaded_function the function to run on the thread
+fn new_thread(threaded_function: closure()) {
+    thread := Thread(threaded_function);
+    thread.start();
+}
+
+/// Blocks the current thread for the provided number of seconds.
+///
+/// @example {
+/// threads::sleep(2); // blocks for 2 seconds
+/// }
+///
+/// @param seconds the number of seconds to block
+fn sleep(seconds: int) {
+    extern::pgc_begin_blocking();
+    extern::peko_sleep_ms(seconds * 1000);
+    extern::pgc_end_blocking();
+}
+
+/// Blocks the current thread for the provided number of milliseconds.
+///
+/// @example {
+/// threads::sleep_ms(500); // blocks for 500 milliseconds
+/// }
+///
+/// @param ms the number of milliseconds to block
+fn sleep_ms(ms: int) {
+    extern::pgc_begin_blocking();
+    extern::peko_sleep_ms(ms);
+    extern::pgc_end_blocking();
+}
+
+/// Runs the provided closure on the main thread.
+/// Returns immediately - the closure runs asynchronously on the main thread.
+///
+/// @param work the closure to run on the main thread
+fn dispatch_main(work: closure()) {
+    wrapper := closure[work]() => opaque {
+        work();
+        return Default;
+    };
+    extern::peko_dispatch_main(wrapper.function, wrapper.context);
+}
+
+[external] fn peko_cancel_token_new() => opaque;
+[external] fn peko_cancel_token_free(t: opaque);
+[external] fn peko_cancel_token_is_cancelled(t: opaque) => bool;
+[external gcsafe] fn peko_cancel_token_cancel(t: opaque);
+[external gcsafe] fn peko_cancel_token_on_cancel(t: opaque, cb: (opaque)(Pointer<void>), cb_data: Pointer<void>);
+
+/// A cooperative cancellation token shared between a thread and its caller.
+/// The running closure checks is_cancelled() at natural points and returns
+/// early when the token is cancelled.
+///
+/// Cancellation is cooperative - the thread is not forcefully stopped.
+/// This is safe and avoids the lock and memory corruption issues caused
+/// by force-killing threads.
+///
+/// @example {
+/// token := threads::CancelToken();
+///
+/// threads::new_thread(closure[token]() {
+///     while !token.is_cancelled() {
+///         do_work();
+///     }
+/// });
+///
+/// // later...
+/// token.cancel();
+/// }
+class CancelToken {
+    [private] handle: opaque;
+
+    /// Creates a new, uncancelled token.
+    constructor() {
+        this.handle = extern::peko_cancel_token_new();
+    }
+
+    /// Returns true if this token has been cancelled.
+    fn is_cancelled() => bool {
+        return extern::peko_cancel_token_is_cancelled(this.handle);
+    }
+
+    /// Cancels this token, firing the on_cancel callback if one is set.
+    /// Safe to call from any thread. Has no effect if already cancelled.
+    fn cancel() {
+        extern::peko_cancel_token_cancel(this.handle);
+    }
+
+    /// Registers a callback to be called when this token is cancelled.
+    /// If the token is already cancelled, the callback fires immediately.
+    /// Only one callback can be registered at a time.
+    ///
+    /// @example {
+    /// token.on_cancel(closure() {
+    ///     console::println("cancelled!");
+    /// });
+    /// }
+    ///
+    /// @param callback the closure to run when the token is cancelled
+    fn on_cancel(callback: closure()) {
+        wrapper := closure[callback]() => opaque {
+            callback();
+            return Default;
+        };
+        extern::peko_cancel_token_on_cancel(
+            this.handle,
+            wrapper.function,
+            wrapper.context
+        );
+    }
+
+    /// Frees the underlying token resources.
+    /// The token must not be used after this call.
+    fn free() {
+        extern::peko_cancel_token_free(this.handle);
+    }
+}
+
+
+[external] fn peko_channel_new(buffer_size: int) => opaque;
+[external] fn peko_channel_free(c: opaque);
+[external gcsafe] fn peko_channel_send(c: opaque, item: Pointer<void>) => bool;
+[external gcsafe] fn peko_channel_try_send(c: opaque, item: Pointer<void>) => bool;
+[external gcsafe] fn peko_channel_recv(c: opaque, out_ok: &bool) => Pointer<void>;
+[external gcsafe] fn peko_channel_try_recv(c: opaque, out_ok: &bool) => Pointer<void>;
+[external gcsafe] fn peko_channel_close(c: opaque);
+[external] fn peko_channel_is_closed(c: opaque) => bool;
+
+/// A thread-safe message channel.
+/// Channels provide safe communication between threads without shared state.
+///
+/// buffer_size controls the channel capacity:
+///   0  - rendezvous channel: send blocks until a receiver is ready
+///   n  - buffered channel: up to n items can be queued before send blocks
+///
+/// @example {
+/// ch := threads::Channel<int>(10);
+///
+/// threads::new_thread(closure[ch]() {
+///     for i in 0..10 {
+///         ch.send(i);
+///     }
+///     ch.close();
+/// });
+///
+/// while true {
+///     item := ch.recv();
+///     if item == None {
+///         break;
+///     }
+///     console::println(item?);
+/// }
+/// }
+class Channel<T> {
+    [private] handle: opaque;
+
+    /// Creates a channel with the given buffer size.
+    /// Use 0 for a rendezvous channel.
+    ///
+    /// @param buffer_size the channel capacity, or 0 for a rendezvous channel
+    constructor(buffer_size: int) {
+        this.handle = extern::peko_channel_new(buffer_size);
+    }
+
+    /// Sends an item into the channel.
+    /// Blocks if the buffer is full.
+    /// Returns false if the channel is closed.
+    ///
+    /// @param item the item to send
+    fn send(item: T) => bool {
+        // Cast through string->Pointer<void> so the GC sees a managed pointer.
+        // item as string gives the primitive managed pointer, then Pointer<void>
+        // is the correct type for the C channel which stores void*.
+        return extern::peko_channel_send(this.handle, item as Pointer<void>);
+    }
+
+    /// Tries to send without blocking.
+    /// Returns true if the item was sent, false if full or closed.
+    ///
+    /// @param item the item to send
+    fn try_send(item: T) => bool {
+        return extern::peko_channel_try_send(this.handle, item as Pointer<void>);
+    }
+
+    /// Receives an item from the channel.
+    /// Blocks if the buffer is empty.
+    /// Returns None if the channel is closed and empty.
+    fn recv() => T? {
+        ok     := false;
+        result := extern::peko_channel_recv(this.handle, &ok);
+        if !ok || result == null {
+            return None;
+        }
+        return result as T;
+    }
+
+    /// Tries to receive without blocking.
+    /// Returns None if the buffer is empty or the channel is closed.
+    fn try_recv() => T? {
+        ok     := false;
+        result := extern::peko_channel_try_recv(this.handle, &ok);
+        if !ok || result == null {
+            return None;
+        }
+        return result as T;
+    }
+
+    /// Closes the channel.
+    /// Senders will get false from send().
+    /// Receivers will drain remaining items then get None.
+    fn close() {
+        extern::peko_channel_close(this.handle);
+    }
+
+    /// Returns true if this channel has been closed.
+    fn is_closed() => bool {
+        return extern::peko_channel_is_closed(this.handle);
+    }
+
+    /// Frees the channel resources.
+    /// The channel must not be used after this call.
+    fn free() {
+        extern::peko_channel_free(this.handle);
+    }
+}
+
+
+[external] fn peko_future_new() => opaque;
+[external] fn peko_future_free(f: opaque);
+[external gcsafe] fn peko_future_set_result(f: opaque, result: Pointer<void>);
+[external gcsafe] fn peko_future_await(f: opaque) => Pointer<void>;
+[external gcsafe] fn peko_future_await_timeout(f: opaque, timeout_ms: int, out_timed_out: &bool) => Pointer<void>;
+[external] fn peko_future_is_complete(f: opaque) => bool;
+[external gcsafe] fn peko_future_cancel(f: opaque);
+
+/// Represents the result of an asynchronous computation.
+/// Obtain a Future via threads::make_future() or Scope::spawn().
+///
+/// @example {
+/// f := threads::make_future(closure() => int {
+///     return expensive_computation();
+/// });
+///
+/// result := f.await();
+/// console::println(result);
+/// }
+class Future<T> {
+    [private] handle: opaque;
+
+    /// Wraps the provided C future handle.
+    ///
+    /// @param handle the underlying C future handle
+    constructor(handle: opaque) {
+        this.handle = handle;
+    }
+
+    /// Blocks the calling thread until the result is available.
+    /// Returns None if the future was cancelled.
+    fn await() => T? {
+        result := extern::peko_future_await(this.handle);
+        if result == null {
+            return None;
+        }
+        return result as T;
+    }
+
+    /// Blocks until the result is available or timeout_ms elapses.
+    /// Returns None on timeout or cancellation.
+    ///
+    /// @param ms the maximum time to wait in milliseconds
+    fn await_timeout(ms: int) => T? {
+        timed_out := false;
+        result    := extern::peko_future_await_timeout(this.handle, ms, &timed_out);
+        if result == null || timed_out {
+            return None;
+        }
+        return result as T;
+    }
+
+    /// Returns true if the result is ready without blocking.
+    fn is_complete() => bool {
+        return extern::peko_future_is_complete(this.handle);
+    }
+
+    /// Signals that the result is no longer needed.
+    /// The running work continues but await() will return None.
+    fn cancel() {
+        extern::peko_future_cancel(this.handle);
+    }
+}
+
+/// Spawns a closure on a new thread and returns a Future for its result.
+/// The Future resolves when the closure returns.
+///
+/// @example {
+/// f := threads::make_future(closure() => string {
+///     return fetch_data();
+/// });
+///
+/// // do other work here...
+///
+/// data := f.await()?;
+/// }
+///
+/// @param work the closure whose result the future resolves to
+fn make_future<T>(work: closure() => T) => Future<T> {
+    f_handle := extern::peko_future_new();
+
+    new_thread(closure[work, f_handle]() {
+        result := work();
+        extern::peko_future_set_result(f_handle, result as Pointer<void>);
+    });
+
+    return Future<T>(f_handle);
+}
+
+
+
+/// Manages a group of futures spawned within a structured scope.
+/// All futures spawned on a Scope are automatically awaited when the
+/// scope body finishes. This guarantees no spawned work outlives the scope.
+///
+/// Obtain a Scope via threads::scope().
+///
+/// @example {
+/// threads::scope(closure(s: threads::Scope) {
+///     f1 := s.spawn(closure() => Pointer<void> { return fetch_a() as Pointer<void>; });
+///     f2 := s.spawn(closure() => Pointer<void> { return fetch_b() as Pointer<void>; });
+///     a := f1.await()? as int;
+///     b := f2.await()? as int;
+/// });
+/// }
+class Scope {
+    [private] futures:      Array<Future<Pointer<void>>>;
+    [private] cancel_token: CancelToken;
+
+    /// Creates an empty scope.
+    constructor() {
+        this.futures      = Array<Future<Pointer<void>>>();
+        this.cancel_token = CancelToken();
+    }
+
+    /// Spawns a closure on a new thread and tracks its Future in this scope.
+    /// The Future is automatically awaited when the scope exits.
+    /// Cast the result of await() to the expected type.
+    ///
+    /// @param work the closure to run on a new thread
+    fn spawn(work: closure() => Pointer<void>) => Future<Pointer<void>> {
+        f := make_future<Pointer<void>>(work);
+        this.futures.push(f);
+        return f;
+    }
+
+    /// Spawns a closure that returns no value.
+    ///
+    /// @param work the closure to run on a new thread
+    fn spawn_void(work: closure()) {
+        f := make_future<Pointer<void>>(closure[work]() => Pointer<void> {
+            work();
+            return Default;
+        });
+        this.futures.push(f);
+    }
+
+    /// Returns a CancelToken shared by all work spawned in this scope.
+    fn get_cancel_token() => CancelToken {
+        return this.cancel_token;
+    }
+
+    /// Cancels all work in this scope.
+    fn cancel() {
+        this.cancel_token.cancel();
+    }
+
+    /// Waits for all spawned futures to complete.
+    /// Called automatically by scope() - do not call this manually.
+    [hide] fn join_all() {
+        for f in this.futures {
+            f.await();
+        }
+    }
+}
+
+/// Runs body inside a structured concurrency scope.
+/// All futures spawned inside body are awaited before scope returns.
+/// This ensures no spawned work outlives the scope.
+///
+/// @example {
+/// threads::scope(closure(s: threads::Scope) {
+///     f := s.spawn(closure() => Pointer<void> {
+///         return fetch_data() as Pointer<void>;
+///     });
+///     data := f.await()?;
+/// });
+/// }
+///
+/// @param body the closure that receives the scope
+fn scope(body: closure(Scope)) {
+    s := Scope();
+    body(s);
+    s.join_all();
+}

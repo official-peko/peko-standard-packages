@@ -1,0 +1,9 @@
+{
+  "name": "fs",
+  "label": "Standard Filesystem Package",
+  "description": "Implements basic filesystem functionality.",
+  "latest": "v0.1.0",
+  "versions": [
+    "v0.1.0"
+  ]
+}

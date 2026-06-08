@@ -1,0 +1,9 @@
+{
+  "name": "webview",
+  "label": "Standard WebView Package",
+  "description": "Implements a cross platform webview for MacOS, IOS, Android, Windows, and Linux.",
+  "latest": "v0.1.0",
+  "versions": [
+    "v0.1.0"
+  ]
+}

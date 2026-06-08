@@ -1,0 +1,718 @@
+//! Implements console fd I/O for Pekoscript.
+//! This package is the low-level fd interface for all console and file
+//! descriptor operations. For text styling see styling functions.
+//! For cursor movement see cursor functions.
+
+import fs@"v0.1.0";
+
+platform android {
+    link libs::android::peko_console as object;
+}
+
+platform ios {
+    arch x86_64 {
+        link libs::ios::x86_64::peko_console as object;
+    }
+
+    arch arm {
+        link libs::ios::arm::peko_console as object;
+    }
+}
+
+platform windows {
+    link libs::windows::peko_console as object;
+}
+
+platform linux {
+    arch x86_64 {
+        link libs::linux::x86_64::peko_console as object;
+    }
+
+    arch arm {
+        link libs::linux::arm::peko_console as object;
+    }
+}
+
+platform macos {
+    arch x86_64 {
+        link libs::macos::x86_64::peko_console as object;
+    }
+
+    arch arm {
+        link libs::macos::arm::peko_console as object;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- C extern declarations ---
+// ---------------------------------------------------------------------------
+
+[external] fn peko_console_init() => int;
+
+// Initialize the console platform layer when this package is first imported.
+// On Windows this enables ANSI escape codes and sets UTF-8 output.
+[private] _console_init: int = extern::peko_console_init();
+[external] fn peko_write_fd(fd: int, buf: Pointer<void>, len: int) => int;
+[external] fn peko_write_fd_string(fd: int, str: cstr) => int;
+[external] fn peko_flush_fd(fd: int) => int;
+[external] fn peko_read_char(fd: int, out: &char) => int;
+[external] fn peko_read_line(fd: int) => string;
+[external] fn peko_open_fd(path: cstr, flags: int) => int;
+[external] fn peko_close_fd(fd: int) => int;
+[external] fn peko_open_null_fd() => int;
+
+// ---------------------------------------------------------------------------
+// --- Fd mock-enum ---
+// ---------------------------------------------------------------------------
+
+/// Standard file descriptor constants.
+///
+/// @example {
+/// console::write(Fd::Stdout, "hello");
+/// console::write(Fd::Stderr, "oops");
+/// }
+module Fd {
+    /// The standard input file descriptor.
+    Stdin:  int = 0;
+    /// The standard output file descriptor.
+    Stdout: int = 1;
+    /// The standard error file descriptor.
+    Stderr: int = 2;
+}
+
+// ---------------------------------------------------------------------------
+// --- FdFlags mock-enum ---
+// ---------------------------------------------------------------------------
+
+/// Flags for opening file descriptors.
+/// Combine them by passing an array to open_fd.
+///
+/// @example {
+/// fd := console::open_fd("log.txt", [FdFlags::Write, FdFlags::Create])?;
+/// }
+module FdFlags {
+    /// Open the file for reading.
+    Read:     int = 1;
+    /// Open the file for writing.
+    Write:    int = 2;
+    /// Append writes to the end of the file.
+    Append:   int = 4;
+    /// Create the file if it does not exist.
+    Create:   int = 8;
+    /// Truncate the file to zero length when opening.
+    Truncate: int = 16;
+}
+
+// ---------------------------------------------------------------------------
+// --- Write ---
+// ---------------------------------------------------------------------------
+
+/// Writes a string to the provided fd.
+/// Returns the number of bytes written, or None on error.
+///
+/// @param fd the file descriptor to write to
+/// @param str the string to write
+///
+/// @example {
+/// console::write(Fd::Stdout, "hello world");
+/// }
+fn write(fd: int, str: string) => int? {
+    result := extern::peko_write_fd_string(fd, str);
+    if result < 0 {
+        return None;
+    }
+    return result;
+}
+
+/// Writes raw bytes from a Buffer to the provided fd.
+/// Returns the number of bytes written, or None on error.
+///
+/// @param fd the file descriptor to write to
+/// @param buf the buffer of bytes to write
+fn write(fd: int, buf: fs::Buffer) => int? {
+    result := extern::peko_write_fd(fd, buf.as_raw(), buf.len());
+    if result < 0 {
+        return None;
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// --- Print (stdout) ---
+// ---------------------------------------------------------------------------
+
+/// Prints a string to stdout with a newline.
+///
+/// @param str the string to print
+///
+/// @example {
+/// console::println("hello world");
+/// }
+fn println(str: string) {
+    extern::peko_write_fd_string(Fd::Stdout, str);
+    extern::peko_write_fd_string(Fd::Stdout, "\n");
+}
+
+/// Prints an int to stdout with a newline.
+///
+/// @param number the int to print
+fn println(number: int) {
+    println(Runtime::IntToString(number));
+}
+
+/// Prints a float to stdout with a newline.
+///
+/// @param number the float to print
+fn println(number: float) {
+    println(Runtime::FloatToString(number));
+}
+
+/// Prints a double to stdout with a newline.
+///
+/// @param number the double to print
+fn println(number: double) {
+    extern::peko_printf("%g\n", number);
+}
+
+/// Prints a bool to stdout with a newline.
+///
+/// @param value the bool to print
+fn println(value: bool) {
+    println(Runtime::BoolToString(value));
+}
+
+/// Prints a char to stdout with a newline.
+///
+/// @param ch the char to print
+fn println(ch: char) {
+    println(Runtime::CharToString(ch));
+}
+
+/// Prints each string in the array to stdout, one per line.
+///
+/// @param array the strings to print
+fn println(array: Array<string>) {
+    for str in array {
+        println(str);
+    }
+}
+
+/// Prints a string to stdout without a newline.
+///
+/// @param str the string to print
+fn print(str: string) {
+    extern::peko_write_fd_string(Fd::Stdout, str);
+}
+
+/// Prints an int to stdout without a newline.
+///
+/// @param number the int to print
+fn print(number: int) {
+    print(Runtime::IntToString(number));
+}
+
+/// Prints a float to stdout without a newline.
+///
+/// @param number the float to print
+fn print(number: float) {
+    print(Runtime::FloatToString(number));
+}
+
+/// Prints a double to stdout without a newline.
+///
+/// @param number the double to print
+fn print(number: double) {
+    extern::peko_printf("%g", number);
+}
+
+/// Prints a bool to stdout without a newline.
+///
+/// @param value the bool to print
+fn print(value: bool) {
+    print(Runtime::BoolToString(value));
+}
+
+/// Prints a char to stdout without a newline.
+///
+/// @param ch the char to print
+fn print(ch: char) {
+    print(Runtime::CharToString(ch));
+}
+
+/// Prints each string in the array to stdout separated by spaces.
+///
+/// @param array the strings to print
+fn print(array: Array<string>) {
+    idx := 0;
+    for str in array {
+        if idx > 0 {
+            extern::peko_write_fd_string(Fd::Stdout, " ");
+        }
+        extern::peko_write_fd_string(Fd::Stdout, str);
+        idx += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- Stderr ---
+// ---------------------------------------------------------------------------
+
+/// Prints a string to stderr with a newline.
+///
+/// @param str the string to print
+fn eprintln(str: string) {
+    extern::peko_write_fd_string(Fd::Stderr, str);
+    extern::peko_write_fd_string(Fd::Stderr, "\n");
+}
+
+/// Prints a string to stderr without a newline.
+///
+/// @param str the string to print
+fn eprint(str: string) {
+    extern::peko_write_fd_string(Fd::Stderr, str);
+}
+
+/// Prints a formatted error message to stderr with a newline.
+///
+/// @param err the error message to print
+///
+/// @example {
+/// console::error("file not found");
+/// // prints: Error: file not found
+/// }
+fn error(err: string) {
+    extern::peko_write_fd_string(Fd::Stderr, "Error: ");
+    extern::peko_write_fd_string(Fd::Stderr, err);
+    extern::peko_write_fd_string(Fd::Stderr, "\n");
+}
+
+// ---------------------------------------------------------------------------
+// --- Flush ---
+// ---------------------------------------------------------------------------
+
+/// Flushes the write buffer for stdout.
+fn flush() {
+    extern::peko_flush_fd(Fd::Stdout);
+}
+
+/// Flushes the write buffer for the provided fd.
+///
+/// @param fd the file descriptor to flush
+fn flush(fd: int) {
+    extern::peko_flush_fd(fd);
+}
+
+// ---------------------------------------------------------------------------
+// --- Read ---
+// ---------------------------------------------------------------------------
+
+/// Reads a single character from stdin.
+/// Returns None on EOF or error.
+fn read_char() => char? {
+    out: char = 0;
+    result := extern::peko_read_char(Fd::Stdin, &out);
+    if result <= 0 {
+        return None;
+    }
+    return out;
+}
+
+/// Reads a single character from the provided fd.
+/// Returns None on EOF or error.
+///
+/// @param fd the file descriptor to read from
+fn read_char(fd: int) => char? {
+    out: char = 0;
+    result := extern::peko_read_char(fd, &out);
+    if result <= 0 {
+        return None;
+    }
+    return out;
+}
+
+/// Reads a line from stdin until a newline or EOF.
+/// The newline is not included in the returned string.
+/// Returns None on error.
+fn read_line() => string? {
+    return extern::peko_read_line(Fd::Stdin);
+}
+
+/// Reads a line from the provided fd until a newline or EOF.
+/// The newline is not included in the returned string.
+/// Returns None on error.
+///
+/// @param fd the file descriptor to read from
+fn read_line(fd: int) => string? {
+    return extern::peko_read_line(fd);
+}
+
+/// Prints the provided query to stdout then reads a line from stdin.
+/// Returns None on error.
+///
+/// @param query the prompt to print before reading
+///
+/// @example {
+/// name := console::input("What is your name? ");
+/// }
+fn input(query: string) => string? {
+    extern::peko_write_fd_string(Fd::Stdout, query);
+    extern::peko_flush_fd(Fd::Stdout);
+    return extern::peko_read_line(Fd::Stdin);
+}
+
+/// Reads a line from stdin without printing a query.
+/// Returns None on error.
+fn input() => string? {
+    return extern::peko_read_line(Fd::Stdin);
+}
+
+// ---------------------------------------------------------------------------
+// --- Fd open / close ---
+// ---------------------------------------------------------------------------
+
+/// Opens the file at path with the provided single flag.
+/// Returns the fd on success, or None on error.
+///
+/// @param path the path of the file to open
+/// @param flag a single flag from the FdFlags module
+fn open_fd(path: string, flag: int) => int? {
+    fd := extern::peko_open_fd(path, flag);
+    if fd < 0 {
+        return None;
+    }
+    return fd;
+}
+
+/// Opens the file at path with a combination of flags.
+/// The flags are OR'd together from the FdFlags module.
+/// Returns the fd on success, or None on error.
+///
+/// @param path the path of the file to open
+/// @param flags the flags to combine from the FdFlags module
+///
+/// @example {
+/// fd := console::open_fd("log.txt", [FdFlags::Write, FdFlags::Create])?;
+/// console::write(fd, "started\n");
+/// console::close_fd(fd);
+/// }
+fn open_fd(path: string, flags: Array<int>) => int? {
+    combined := 0;
+    for f in flags {
+        combined = combined + f;
+    }
+    fd := extern::peko_open_fd(path, combined);
+    if fd < 0 {
+        return None;
+    }
+    return fd;
+}
+
+/// Closes the provided fd.
+/// Returns false on error.
+///
+/// @param fd the file descriptor to close
+fn close_fd(fd: int) => bool {
+    return extern::peko_close_fd(fd) == 0;
+}
+
+/// Opens a null device fd for discarding output.
+/// Returns None on error.
+///
+/// @example {
+/// null_fd := console::open_null()?;
+/// console::write(null_fd, "this is discarded");
+/// console::close_fd(null_fd);
+/// }
+fn open_null() => int? {
+    fd := extern::peko_open_null_fd();
+    if fd < 0 {
+        return None;
+    }
+    return fd;
+}
+
+// ---------------------------------------------------------------------------
+// --- Argv ---
+// ---------------------------------------------------------------------------
+
+/// Returns the command line arguments passed to this program.
+fn get_argv() => Array<String> {
+    return system_args;
+}
+
+/// Applies bold formatting to the provided string.
+///
+/// @example {
+/// console::println(console::bold("important"));
+/// }
+fn bold(input: string) => string {
+    return `\x1b[1m${input}\x1b[0m`;
+}
+
+/// Applies dim formatting to the provided string.
+fn dim(input: string) => string {
+    return `\x1b[2m${input}\x1b[0m`;
+}
+
+/// Applies italic formatting to the provided string.
+fn italic(input: string) => string {
+    return `\x1b[3m${input}\x1b[0m`;
+}
+
+/// Applies underline formatting to the provided string.
+fn underline(input: string) => string {
+    return `\x1b[4m${input}\x1b[0m`;
+}
+
+/// Applies blinking formatting to the provided string.
+fn blinking(input: string) => string {
+    return `\x1b[5m${input}\x1b[0m`;
+}
+
+/// Applies reverse video formatting to the provided string.
+fn reverse(input: string) => string {
+    return `\x1b[7m${input}\x1b[0m`;
+}
+
+/// Hides the provided string.
+fn hidden(input: string) => string {
+    return `\x1b[8m${input}\x1b[0m`;
+}
+
+/// Applies strikethrough formatting to the provided string.
+fn strikethrough(input: string) => string {
+    return `\x1b[9m${input}\x1b[0m`;
+}
+
+// ---------------------------------------------------------------------------
+// --- Foreground colors ---
+// ---------------------------------------------------------------------------
+
+/// Sets the foreground color to black.
+fn black(input: string) => string {
+    return `\x1b[30m${input}\x1b[0m`;
+}
+
+/// Sets the foreground color to red.
+fn red(input: string) => string {
+    return `\x1b[31m${input}\x1b[0m`;
+}
+
+/// Sets the foreground color to green.
+fn green(input: string) => string {
+    return `\x1b[32m${input}\x1b[0m`;
+}
+
+/// Sets the foreground color to yellow.
+fn yellow(input: string) => string {
+    return `\x1b[33m${input}\x1b[0m`;
+}
+
+/// Sets the foreground color to blue.
+fn blue(input: string) => string {
+    return `\x1b[34m${input}\x1b[0m`;
+}
+
+/// Sets the foreground color to magenta.
+fn magenta(input: string) => string {
+    return `\x1b[35m${input}\x1b[0m`;
+}
+
+/// Sets the foreground color to cyan.
+fn cyan(input: string) => string {
+    return `\x1b[36m${input}\x1b[0m`;
+}
+
+/// Sets the foreground color to white.
+fn white(input: string) => string {
+    return `\x1b[37m${input}\x1b[0m`;
+}
+
+// ---------------------------------------------------------------------------
+// --- Background colors ---
+// ---------------------------------------------------------------------------
+
+/// Sets the background color to black.
+fn bg_black(input: string) => string {
+    return `\x1b[40m${input}\x1b[0m`;
+}
+
+/// Sets the background color to red.
+fn bg_red(input: string) => string {
+    return `\x1b[41m${input}\x1b[0m`;
+}
+
+/// Sets the background color to green.
+fn bg_green(input: string) => string {
+    return `\x1b[42m${input}\x1b[0m`;
+}
+
+/// Sets the background color to yellow.
+fn bg_yellow(input: string) => string {
+    return `\x1b[43m${input}\x1b[0m`;
+}
+
+/// Sets the background color to blue.
+fn bg_blue(input: string) => string {
+    return `\x1b[44m${input}\x1b[0m`;
+}
+
+/// Sets the background color to magenta.
+fn bg_magenta(input: string) => string {
+    return `\x1b[45m${input}\x1b[0m`;
+}
+
+/// Sets the background color to cyan.
+fn bg_cyan(input: string) => string {
+    return `\x1b[46m${input}\x1b[0m`;
+}
+
+/// Sets the background color to white.
+fn bg_white(input: string) => string {
+    return `\x1b[47m${input}\x1b[0m`;
+}
+
+// ---------------------------------------------------------------------------
+// --- RGB colors ---
+// ---------------------------------------------------------------------------
+
+/// Sets the foreground color to the provided RGB values.
+///
+/// @param input the string to color
+/// @param r the red component (0-255)
+/// @param g the green component (0-255)
+/// @param b the blue component (0-255)
+///
+/// @example {
+/// console::println(console::rgb("orange text", 255, 165, 0));
+/// }
+fn rgb(input: string, r: int, g: int, b: int) => string {
+    return `\x1b[38;2;${r};${g};${b}m${input}\x1b[0m`;
+}
+
+/// Sets the background color to the provided RGB values.
+///
+/// @param input the string to color
+/// @param r the red component (0-255)
+/// @param g the green component (0-255)
+/// @param b the blue component (0-255)
+fn bg_rgb(input: string, r: int, g: int, b: int) => string {
+    return `\x1b[48;2;${r};${g};${b}m${input}\x1b[0m`;
+}
+
+
+// ---------------------------------------------------------------------------
+// --- Cursor movement ---
+// ---------------------------------------------------------------------------
+
+/// Moves the cursor left by 1 cell.
+fn left() {
+    extern::peko_printf("\x1b[D");
+}
+
+/// Moves the cursor left by n cells.
+fn left(n: int) {
+    extern::peko_printf("\x1b[%dD", n);
+}
+
+/// Moves the cursor right by 1 cell.
+fn right() {
+    extern::peko_printf("\x1b[C");
+}
+
+/// Moves the cursor right by n cells.
+fn right(n: int) {
+    extern::peko_printf("\x1b[%dC", n);
+}
+
+/// Moves the cursor up by 1 line.
+fn up() {
+    extern::peko_printf("\x1b[A");
+}
+
+/// Moves the cursor up by n lines.
+fn up(n: int) {
+    extern::peko_printf("\x1b[%dA", n);
+}
+
+/// Moves the cursor down by 1 line.
+fn down() {
+    extern::peko_printf("\x1b[B");
+}
+
+/// Moves the cursor down by n lines.
+fn down(n: int) {
+    extern::peko_printf("\x1b[%dB", n);
+}
+
+/// Moves the cursor to the given row and column (1-based).
+///
+/// @param row the row to move to
+/// @param col the column to move to
+fn move_to(row: int, col: int) {
+    extern::peko_printf("\x1b[%d;%dH", row, col);
+}
+
+/// Moves the cursor to the home position (top-left corner).
+fn home() {
+    extern::peko_printf("\x1b[H");
+}
+
+/// Moves the cursor to the start of the current line.
+fn move_to_start() {
+    extern::peko_printf("\r");
+}
+
+// ---------------------------------------------------------------------------
+// --- Cursor state ---
+// ---------------------------------------------------------------------------
+
+/// Saves the current cursor position.
+/// Use restore() to return to this position.
+fn save() {
+    extern::peko_printf("\x1b[s");
+}
+
+/// Restores the cursor to the last saved position.
+fn restore() {
+    extern::peko_printf("\x1b[u");
+}
+
+/// Hides the cursor.
+fn hide_cursor() {
+    extern::peko_printf("\x1b[?25l");
+}
+
+/// Shows the cursor.
+fn show_cursor() {
+    extern::peko_printf("\x1b[?25h");
+}
+
+// ---------------------------------------------------------------------------
+// --- Erase operations ---
+// ---------------------------------------------------------------------------
+
+/// Erases from the cursor to the end of the current line.
+fn erase_to_end() {
+    extern::peko_printf("\x1b[0K");
+}
+
+/// Erases from the start of the current line to the cursor.
+fn erase_from_start() {
+    extern::peko_printf("\x1b[1K");
+}
+
+/// Erases the entire current line.
+fn erase_line() {
+    extern::peko_printf("\x1b[2K");
+}
+
+/// Clears the entire visible console screen.
+fn clear() {
+    extern::peko_printf("\x1b[2J");
+}
+
+/// Clears the console screen and the scrollback buffer.
+fn clear_scrollback() {
+    extern::peko_printf("\x1b[3J");
+}

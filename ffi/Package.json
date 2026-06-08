@@ -1,0 +1,9 @@
+{
+  "name": "ffi",
+  "label": "Standard C FFI Library",
+  "description": "Implements needed C FFI functions.",
+  "latest": "v0.1.0",
+  "versions": [
+    "v0.1.0"
+  ]
+}

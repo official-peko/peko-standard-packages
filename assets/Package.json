@@ -1,0 +1,9 @@
+{
+  "name": "assets",
+  "label": "Asset Manager Package",
+  "description": "Implements asset management for Peko apps.",
+  "latest": "v0.1.0",
+  "versions": [
+    "v0.1.0"
+  ]
+}

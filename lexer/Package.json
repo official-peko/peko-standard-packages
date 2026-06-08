@@ -1,0 +1,9 @@
+{
+  "name": "lexer",
+  "label": "Standard Lexing Package",
+  "description": "Implements basic tokenization for string parsing.",
+  "latest": "v0.1.0",
+  "versions": [
+    "v0.1.0"
+  ]
+}

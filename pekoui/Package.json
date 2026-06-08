@@ -1,0 +1,9 @@
+{
+  "name": "pekoui",
+  "label": "Standard UI Package",
+  "description": "Implements the UI backend for Peko.",
+  "latest": "v0.1.0",
+  "versions": [
+    "v0.1.0"
+  ]
+}

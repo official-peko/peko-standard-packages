@@ -1,0 +1,9 @@
+{
+  "name": "sockets",
+  "label": "Standard Socket Package",
+  "description": "Implements basic socket functionality for TCP, HTTP, and WebSocket.",
+  "latest": "v0.1.0",
+  "versions": [
+    "v0.1.0"
+  ]
+}

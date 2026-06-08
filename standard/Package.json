@@ -1,0 +1,9 @@
+{
+  "name": "standard",
+  "label": "The Standard Package",
+  "description": "Implements basic data structures and standard functionality.",
+  "latest": "v0.1.0",
+  "versions": [
+    "v0.1.0"
+  ]
+}

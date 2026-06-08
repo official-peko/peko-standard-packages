@@ -1,0 +1,203 @@
+//! Implements asset bundling and serving for Pekoscript.
+//! Assets are bundled into the app and served at runtime over a local HTTP
+//! socket. Call get_asset_url to obtain a URL for use in HTML, or
+//! get_asset_bytes to read an asset's raw bytes.
+
+import threads@"v0.1.0";
+
+// ---------------------------------------------------------------------------
+// Native object linking.
+// Every platform links the two shared objects (the platform-independent asset
+// HTTP server and the one-shot byte reader) plus its own asset layer object,
+// which fetches raw bytes from that platform's bundle:
+//   - linux:   peko_assets_linux   (AppImage squashfs via APPDIR)
+//   - macos:   peko_assets_apple   (NSBundle resources)
+//   - ios:     peko_assets_apple   (NSBundle resources)
+//   - android: peko_assets_android (NDK AAssetManager)
+//   - windows: peko_assets_windows (embedded .rc resources)
+// ---------------------------------------------------------------------------
+
+platform android {
+    link libs::android::peko_asset_server as object;
+    link libs::android::peko_asset_bytes as object;
+    link libs::android::peko_assets_android as object;
+}
+
+platform ios {
+    arch x86_64 {
+        link libs::ios::x86_64::peko_asset_server as object;
+        link libs::ios::x86_64::peko_asset_bytes as object;
+        link libs::ios::x86_64::peko_assets_apple as object;
+    }
+
+    arch arm {
+        link libs::ios::arm::peko_asset_server as object;
+        link libs::ios::arm::peko_asset_bytes as object;
+        link libs::ios::arm::peko_assets_apple as object;
+    }
+}
+
+platform windows {
+    link libs::windows::peko_asset_server as object;
+    link libs::windows::peko_asset_bytes as object;
+    link libs::windows::peko_assets_windows as object;
+}
+
+platform linux {
+    arch x86_64 {
+        link libs::linux::x86_64::peko_asset_server as object;
+        link libs::linux::x86_64::peko_asset_bytes as object;
+        link libs::linux::x86_64::peko_assets_linux as object;
+    }
+
+    arch arm {
+        link libs::linux::arm::peko_asset_server as object;
+        link libs::linux::arm::peko_asset_bytes as object;
+        link libs::linux::arm::peko_assets_linux as object;
+    }
+}
+
+platform macos {
+    arch x86_64 {
+        link libs::macos::x86_64::peko_asset_server as object;
+        link libs::macos::x86_64::peko_asset_bytes as object;
+        link libs::macos::x86_64::peko_assets_apple as object;
+    }
+
+    arch arm {
+        link libs::macos::arm::peko_asset_server as object;
+        link libs::macos::arm::peko_asset_bytes as object;
+        link libs::macos::arm::peko_assets_apple as object;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Native asset layer and asset HTTP server.
+// The asset layer retrieves raw bytes from the platform bundle; the server
+// streams them to a webview with Range support. Both are implemented in the
+// package's C sources.
+// ---------------------------------------------------------------------------
+
+// Starts the asset HTTP server on a dynamic loopback port. debug_dir is the
+// project assets directory in debug builds, or an empty string in release
+// builds. Returns the bound port, or 0 on failure.
+[external] fn peko_asset_server_start(debug_dir: cstr) => int;
+
+// Returns the port the asset server is bound to, or 0 if not started.
+[external] fn peko_asset_server_port() => int;
+
+// Stops the asset server and releases its resources.
+[external] fn peko_asset_server_stop();
+
+// Reads a whole asset into GC-managed memory. dir is the debug directory (or
+// empty for the bundle), name is the asset name. Writes the byte count to
+// out_len and returns the buffer, or null if the asset does not exist.
+[external] fn peko_asset_bytes(dir: cstr, name: cstr, out_len: &int) => Pointer<void>;
+
+// Reads a single byte (0..255) from a peko_asset_bytes buffer, or -1 if the
+// index is out of range.
+[external] fn peko_asset_byte_at(buffer: Pointer<void>, length: int, index: int) => int;
+
+// ---------------------------------------------------------------------------
+// Debug globals, set by the codegen context (the same mechanism as the UI
+// framework's debug_mode / debug_styles_dir). In release builds asset_debug is
+// false and asset_debug_dir is empty, so assets come from the native bundle.
+// In incremental dev runs the cli sets them, and assets are served from
+// asset_debug_dir on disk so hot-reload runs do not require rebundling.
+// ---------------------------------------------------------------------------
+
+[hide] asset_debug:     bool   = false;
+[hide] asset_debug_dir: cstr = "";
+
+// Private module-level port the asset server is bound to. Set once when the
+// server starts and used to construct asset URLs.
+[hide] asset_server_port: int = 0;
+
+// ---------------------------------------------------------------------------
+// Server lifecycle
+// ---------------------------------------------------------------------------
+
+/// Starts the asset server if it is not already running.
+/// Binds a dynamic loopback port and records it for URL construction. Called
+/// automatically the first time an asset URL or asset bytes are requested, so
+/// user code does not normally need to call it directly.
+fn ensure_started() {
+    if asset_server_port != 0 {
+        return;
+    }
+
+    debug_dir := cstring("");
+    if asset_debug {
+        debug_dir = asset_debug_dir;
+    }
+
+    asset_server_port = extern::peko_asset_server_start(debug_dir);
+}
+
+/// Stops the asset server and releases its resources.
+/// Asset URLs become invalid after this call. Intended for clean shutdown.
+fn stop() {
+    if asset_server_port == 0 {
+        return;
+    }
+    extern::peko_asset_server_stop();
+    asset_server_port = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Returns the URL for a bundled asset, usable directly in HTML tags.
+/// The asset is served over the local HTTP socket at a reserved prefix, so the
+/// URL works the same in debug and release builds; only the byte source
+/// differs. Names are hierarchical, so "icons/home.png" preserves its
+/// subdirectory. A missing asset is not an error here; the URL simply returns
+/// a 404 when fetched.
+///
+/// @param name the asset name, e.g. "icons/home.png"
+///
+/// @example {
+/// url := bundler::get_asset_url("icons/home.png");
+/// img := <img src={url} />;
+/// }
+fn get_asset_url(name: string) => string {
+    ensure_started();
+    return `http://127.0.0.1:${asset_server_port}/_assets/${name}`;
+}
+
+/// Returns the raw bytes of a bundled asset as an Array of byte values.
+/// Each call returns a fresh copy; the package does not cache on the
+/// Pekoscript side. Returns an empty array if the asset does not exist. In
+/// debug builds the bytes are read from the project assets directory; in
+/// release builds they come from the native bundle.
+///
+/// @param name the asset name, e.g. "data/config.json"
+///
+/// @example {
+/// bytes := bundler::get_asset_bytes("data/config.json");
+/// console::println(bytes.length());
+/// }
+fn get_asset_bytes(name: string) => Array<int> {
+    result := Array<int>();
+
+    dir := cstring("");
+    if asset_debug {
+        dir = asset_debug_dir;
+    }
+
+    out_len := 0;
+    buffer  := extern::peko_asset_bytes(dir, name as cstr, &out_len);
+
+    if out_len == 0 {
+        return result;
+    }
+
+    i := 0;
+    while i < out_len {
+        result.push(extern::peko_asset_byte_at(buffer, out_len, i));
+        i += 1;
+    }
+
+    return result;
+}

@@ -1,0 +1,2185 @@
+//! This file implements socket functionality for Pekoscript.
+//! Websockets, HTTP sockets, HTTPS over TLS, and raw TCP sockets are all
+//! implemented here. Outbound traffic is built with the Request class and
+//! its HttpRequest subclass. Received traffic is read with the Response
+//! class and its HttpResponse subclass.
+
+import threads@"v0.0.1";
+import fs@"v0.0.1";
+
+platform android {
+    link libs::android::peko_sockets as object;
+    link libs::android::peko_websocket as object;
+    link libs::android::peko_sockets_tls as object;
+    link libs::android::libbearssl as archive;
+}
+
+platform ios {
+    arch x86_64 {
+        link libs::ios::x86_64::peko_sockets as object;
+        link libs::ios::x86_64::peko_websocket as object;
+        link libs::ios::x86_64::peko_sockets_tls as object;
+        link libs::ios::x86_64::libbearssl as archive;
+    }
+
+    arch arm {
+        link libs::ios::arm::peko_sockets as object;
+        link libs::ios::arm::peko_websocket as object;
+        link libs::ios::arm::peko_sockets_tls as object;
+        link libs::ios::arm::libbearssl as archive;
+    }
+}
+
+platform windows {
+    link libs::windows::peko_sockets as object;
+    link libs::windows::peko_websocket as object;
+    link libs::windows::peko_sockets_tls as object;
+    link libs::windows::bearssl as lib;
+}
+
+platform linux {
+    arch x86_64 {
+        link libs::linux::x86_64::peko_sockets as object;
+        link libs::linux::x86_64::peko_websocket as object;
+        link libs::linux::x86_64::peko_sockets_tls as object;
+        link libs::linux::x86_64::libbearssl as archive;
+    }
+
+    arch arm {
+        link libs::linux::arm::peko_sockets as object;
+        link libs::linux::arm::peko_websocket as object;
+        link libs::linux::arm::peko_sockets_tls as object;
+        link libs::linux::arm::libbearssl as archive;
+    }
+}
+
+platform macos {
+    arch x86_64 {
+        link libs::macos::x86_64::peko_sockets as object;
+        link libs::macos::x86_64::peko_websocket as object;
+        link libs::macos::x86_64::peko_sockets_tls as object;
+        link libs::macos::x86_64::libbearssl as archive;
+    }
+
+    arch arm {
+        link libs::macos::arm::peko_sockets as object;
+        link libs::macos::arm::peko_websocket as object;
+        link libs::macos::arm::peko_sockets_tls as object;
+        link libs::macos::arm::libbearssl as archive;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- C extern declarations ---
+// ---------------------------------------------------------------------------
+
+[external notrack] fn pgc_begin_blocking();
+[external notrack] fn pgc_end_blocking();
+
+[external gcsafe] fn peko_create_request(host: cstr, port: int, request: cstr) => string;
+[external gcsafe] fn peko_create_request_tls(host: cstr, port: int, request: cstr) => string;
+[external gcsafe] fn peko_stream_request(
+    host: cstr, port: int, request: cstr,
+    on_headers: (int)(Pointer<void>, cstr), headers_ctx: Pointer<void>,
+    on_chunk: (bool)(Pointer<void>, cstr, int), chunk_ctx: Pointer<void>
+) => int;
+[external gcsafe] fn peko_stream_request_tls(
+    host: cstr, port: int, request: cstr,
+    on_headers: (int)(Pointer<void>, cstr), headers_ctx: Pointer<void>,
+    on_chunk: (bool)(Pointer<void>, cstr, int), chunk_ctx: Pointer<void>
+) => int;
+[external gcsafe] fn peko_open_stream_request(host: cstr, port: int, request_head: cstr) => opaque;
+[external gcsafe] fn peko_stream_write_chunk(handle: opaque, bytes: cstr, len: int) => int;
+[external gcsafe] fn peko_stream_finish(handle: opaque) => string;
+[external gcsafe] fn peko_stream_abort(handle: opaque);
+[external gcsafe] fn peko_open_stream_request_tls(host: cstr, port: int, request_head: cstr) => opaque;
+[external gcsafe] fn peko_stream_write_chunk_tls(handle: opaque, bytes: cstr, len: int) => int;
+[external gcsafe] fn peko_stream_finish_tls(handle: opaque) => string;
+[external gcsafe] fn peko_stream_abort_tls(handle: opaque);
+[external gcsafe] fn peko_create_listen_socket(port: &int) => int;
+[external gcsafe] fn peko_accept_connection(listen_socket: int, request_handle: (cstr)(Pointer<void>, cstr), data: Pointer<void>) => int;
+[external gcsafe] fn peko_download_to_file(host: cstr, port: int, request: cstr, fpath: cstr, chunk_size: int) => int;
+[external gcsafe] fn peko_ws_accept_connection(listen_socket: int, current_client: &int, message_handle: (void)(Pointer<void>, int, cstr), data: Pointer<void>) => int;
+[external gcsafe] fn peko_ws_send_text(socket: int, text: cstr) => int;
+
+// ---------------------------------------------------------------------------
+// --- Internal parsing helpers ---
+// ---------------------------------------------------------------------------
+
+/// Internal accumulator for SSE chunk-to-event parsing.
+/// Buffers incoming raw bytes and exposes a method to extract complete events
+/// (text up to the next blank line) in order. The class exists so the chunk
+/// callback in stream_sse can carry mutable state across invocations without
+/// relying on reassigning a captured local.
+class SseBuffer {
+    [private] buffer: String;
+
+    constructor() {
+        this.buffer = String();
+    }
+
+    /// Appends bytes to the buffer.
+    ///
+    /// @param chunk the bytes to append
+    [mutates] fn push_chunk(chunk: String) {
+        this.buffer.push(chunk as string);
+    }
+
+    /// Extracts the next complete event from the buffer, if one is available.
+    /// An event ends at the next blank line (a "\n\n" sequence). Returns None
+    /// when the buffer does not yet contain a complete event. On success the
+    /// returned event text excludes the terminating blank line, and the
+    /// buffer advances past the event.
+    [mutates] fn take_event() => String? {
+        separator := this.buffer.find("\n\n");
+        if separator == -1 {
+            return None;
+        }
+
+        event_text := this.buffer.substring(0, separator);
+        rest       := this.buffer.substring(separator + 2);
+
+        new_buffer := String();
+        if rest.is_value() {
+            new_buffer.push(rest? as string);
+        }
+        this.buffer = new_buffer;
+
+        if !event_text.is_value() {
+            return String("");
+        }
+        return event_text;
+    }
+}
+
+/// Extracts the data payload from a Server-Sent Events event block.
+/// An SSE event is a sequence of lines like "data: text", optionally with
+/// other fields (event:, id:, retry:). The data payloads from each "data:"
+/// line are joined with newlines. Lines that are not "data:" are ignored.
+///
+/// @param event_text the raw event text without the trailing blank line
+[private] fn extract_sse_data(event_text: String) => String {
+    out := String();
+    lines := event_text.split('\n');
+    first := true;
+    for raw_line in lines {
+        line := String(raw_line);
+
+        // Drop a trailing CR from the line, since SSE allows CRLF or LF.
+        while line.length() > 0 && line[line.length() - 1] == '\r' {
+            line.remove(line.length() - 1);
+        }
+
+        if !line.starts_with("data:") {
+            continue;
+        }
+
+        // The "data:" prefix is followed by an optional single space.
+        payload_start := 5;
+        if payload_start < line.length() && line[payload_start] == ' ' {
+            payload_start += 1;
+        }
+
+        payload := line.substring(payload_start);
+        if !payload.is_value() {
+            continue;
+        }
+
+        if first {
+            first = false;
+        } else {
+            out.push('\n');
+        }
+        out.push(payload? as string);
+    }
+    return out;
+}
+
+/// Parses a hexadecimal string into an integer.
+/// Accepts digits 0-9 and letters a-f or A-F.
+/// Returns None if the string is empty or contains a non-hex character.
+///
+/// @param hex the hexadecimal string to parse
+[private] fn parse_hex_int(hex: String) => int? {
+    if hex.length() == 0 {
+        return None;
+    }
+
+    value := 0;
+    i := 0;
+    while i < hex.length() {
+        ch := hex[i];
+        digit := 0;
+        if ch >= '0' && ch <= '9' {
+            digit = (ch - '0') as int;
+        } else if ch >= 'a' && ch <= 'f' {
+            digit = (ch - 'a') as int + 10;
+        } else if ch >= 'A' && ch <= 'F' {
+            digit = (ch - 'A') as int + 10;
+        } else {
+            return None;
+        }
+        value = value * 16 + digit;
+        i += 1;
+    }
+
+    return value;
+}
+
+/// Decodes a URL-encoded string.
+/// Replaces + with a space and %XX sequences with the decoded byte.
+///
+/// @param s the URL-encoded string
+[private] fn url_decode(s: String) => String {
+    result := String();
+    i := 0;
+    while i < s.length() {
+        ch := s[i];
+        if ch == '+' {
+            result.push(' ');
+            i += 1;
+        } else if ch == '%' && i + 2 < s.length() {
+            hex := s.substring(i + 1, i + 3)?;
+            code := parse_hex_int(hex);
+            if code.is_value() {
+                result.push(code? as char);
+            } else {
+                result.push('%');
+            }
+            i += 3;
+        } else {
+            result.push(ch);
+            i += 1;
+        }
+    }
+    return result;
+}
+
+/// Returns an ASCII-lowercased copy of the string.
+/// Each byte in the range A-Z maps to the matching a-z byte. All other bytes
+/// are copied unchanged.
+///
+/// @param s the string to fold
+[private] fn to_lower_str(s: String) => String {
+    out := String();
+    i := 0;
+    while i < s.length() {
+        ch := s[i];
+        if ch >= 'A' && ch <= 'Z' {
+            lowered := (ch - 'A') as int + ('a' as int);
+            out.push(lowered as char);
+        } else {
+            out.push(ch);
+        }
+        i += 1;
+    }
+    return out;
+}
+
+/// Parses a decimal HTTP status code from a token.
+/// Accepts digits 0-9 only. Returns None when the token is empty or holds a
+/// non-digit.
+///
+/// @param token the status-code token
+[private] fn parse_status_code(token: String) => int? {
+    if token.length() == 0 {
+        return None;
+    }
+    value := 0;
+    i := 0;
+    while i < token.length() {
+        ch := token[i];
+        if ch < '0' || ch > '9' {
+            return None;
+        }
+        value = value * 10 + (ch - '0') as int;
+        i += 1;
+    }
+    return value;
+}
+
+/// Returns a short reason phrase for a status code.
+/// Common codes map to their standard phrase. Other codes map to OK for 2xx
+/// and to Error otherwise.
+///
+/// @param code the HTTP status code
+[private] fn reason_phrase(code: int) => String {
+    if code == 200 { return String("OK"); }
+    if code == 201 { return String("Created"); }
+    if code == 204 { return String("No Content"); }
+    if code == 301 { return String("Moved Permanently"); }
+    if code == 302 { return String("Found"); }
+    if code == 304 { return String("Not Modified"); }
+    if code == 400 { return String("Bad Request"); }
+    if code == 401 { return String("Unauthorized"); }
+    if code == 403 { return String("Forbidden"); }
+    if code == 404 { return String("Not Found"); }
+    if code == 500 { return String("Internal Server Error"); }
+    if code >= 200 && code < 300 { return String("OK"); }
+    return String("Error");
+}
+
+/// Returns true when needle appears anywhere in haystack.
+///
+/// @param haystack the string to search
+/// @param needle the substring to find
+[private] fn contains_substr(haystack: String, needle: String) => bool {
+    if needle.length() == 0 {
+        return true;
+    }
+    if needle.length() > haystack.length() {
+        return false;
+    }
+    last := haystack.length() - needle.length();
+    i := 0;
+    while i <= last {
+        sub := haystack.substring(i, i + needle.length());
+        if sub.is_value() && sub? == needle {
+            return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+/// Splits a raw HTTP message into the header block and the body.
+/// The split point is the first blank line (\r\n\r\n).
+/// Index 0 of the returned array is the header block including the request or
+/// status line. Index 1 is the body. The body is empty when no blank line is
+/// present.
+///
+/// @param raw the full raw HTTP message
+[private] fn split_head_body(raw: String) => Array<String> {
+    out := Array<String>();
+    parts := raw.split("\r\n\r\n");
+
+    if parts.length() < 2 {
+        out.push(raw);
+        out.push(String(""));
+        return out;
+    }
+
+    head := parts[0];
+
+    // Rejoin everything after the first blank line so a body that itself
+    // contains a blank line stays intact.
+    body := String();
+    j := 1;
+    while j < parts.length() {
+        if j > 1 {
+            body.push("\r\n\r\n");
+        }
+        body.push(parts[j]);
+        j += 1;
+    }
+
+    out.push(head);
+    out.push(body);
+    return out;
+}
+
+/// Decodes an HTTP chunked transfer-encoding body into a plain body.
+/// Each chunk starts with a hexadecimal size line, followed by that many
+/// bytes, followed by a CRLF. A zero-size chunk ends the body.
+///
+/// @param body the chunked body bytes
+[private] fn dechunk(body: String) => String {
+    out := String();
+    i := 0;
+    n := body.length();
+
+    while i < n {
+        // Read the hexadecimal size line up to CR or LF.
+        size_start := i;
+        while i < n && body[i] != '\r' && body[i] != '\n' {
+            i += 1;
+        }
+
+        size_str := body.substring(size_start, i)?;
+
+        // A chunk-size line may carry extensions after a semicolon. Keep only
+        // the size token before the first semicolon.
+        semi := size_str.lsplit(';');
+        size_token := semi[0];
+
+        chunk_size := parse_hex_int(String(size_token.trim()));
+        if !chunk_size.is_value() {
+            break;
+        }
+
+        // Advance past the CRLF that ends the size line.
+        while i < n && body[i] != '\n' {
+            i += 1;
+        }
+        if i < n {
+            i += 1;
+        }
+
+        size := chunk_size?;
+        if size == 0 {
+            break;
+        }
+
+        // Copy the chunk data.
+        copied := 0;
+        while copied < size && i < n {
+            out.push(body[i]);
+            i += 1;
+            copied += 1;
+        }
+
+        // Advance past the CRLF that follows the chunk data.
+        if i < n && body[i] == '\r' {
+            i += 1;
+        }
+        if i < n && body[i] == '\n' {
+            i += 1;
+        }
+    }
+
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// --- Response ---
+// ---------------------------------------------------------------------------
+
+/// A response received from a socket request.
+///
+/// Wraps the full raw response bytes. For HTTP and HTTPS responses, use the
+/// HttpResponse subclass to read the status code, headers, and de-chunked
+/// body. For raw TCP, the content is the full reply.
+class Response {
+    [private] content: String;
+
+    /// Wraps the provided response content.
+    ///
+    /// @param content the raw response bytes
+    constructor(content: String) {
+        this.content = content;
+    }
+
+    /// Returns the full raw response bytes.
+    fn get_response() => String {
+        return this.content;
+    }
+
+    /// Returns the response body.
+    /// For an HTTP response this is the content after the blank header line.
+    /// For a raw TCP response this is the full content.
+    fn body() => String {
+        split := split_head_body(this.content);
+        if split[1].length() == 0 {
+            return this.content;
+        }
+        return split[1];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- HttpResponse ---
+// ---------------------------------------------------------------------------
+
+/// An HTTP response.
+///
+/// A client wraps a received response and reads the status code, headers, and
+/// de-chunked body. A server builds a response with the chain setters and a
+/// status code, then serializes it with get_response().
+///
+/// @example {
+/// // Server side: build a response.
+/// resp := sockets::HttpResponse("<h1>Hello</h1>", 200)
+///     .header("X-Powered-By", "peko")
+///     .content_type("text/html");
+///
+/// // Client side: read a received response.
+/// status := received.status_code();
+/// kind   := received.header("Content-Type");
+/// data   := received.body();
+/// }
+class HttpResponse from Response {
+    [private] status_code_value: int;
+    [private] content_type_value: String;
+    [private] header_lines: Array<String>;
+    [private] body_value: String;
+    [private] parsed_from_raw: bool;
+    [private] raw_text: String;
+
+    /// Builds an outbound response with content and a status code.
+    /// The content type defaults to text/html.
+    ///
+    /// @param content the response body
+    /// @param status_code the HTTP status code
+    constructor(content: String, status_code: int) => super(content) {
+        this.status_code_value  = status_code;
+        this.content_type_value = String("text/html");
+        this.header_lines       = Array<String>();
+        this.body_value         = content;
+        this.parsed_from_raw    = false;
+        this.raw_text           = String("");
+    }
+
+    /// Builds an outbound response with content, a status code, and a content
+    /// type.
+    ///
+    /// @param content the response body
+    /// @param status_code the HTTP status code
+    /// @param content_type the MIME content type
+    constructor(content: String, status_code: int, content_type: String) => super(content) {
+        this.status_code_value  = status_code;
+        this.content_type_value = content_type;
+        this.header_lines       = Array<String>();
+        this.body_value         = content;
+        this.parsed_from_raw    = false;
+        this.raw_text           = String("");
+    }
+
+    /// Parses a received raw HTTP response into a readable HttpResponse.
+    /// The status code, content type, header lines, and de-chunked body are
+    /// extracted from the raw bytes.
+    ///
+    /// @param raw_response the raw response bytes
+    constructor(raw_response: String) => super(raw_response) {
+        this.status_code_value  = 0;
+        this.content_type_value = String("");
+        this.header_lines       = Array<String>();
+        this.body_value         = String("");
+        this.parsed_from_raw    = true;
+        this.raw_text           = raw_response;
+
+        split := split_head_body(raw_response);
+        head := split[0];
+        raw_body := split[1];
+
+        head_lines := head.split("\r\n");
+
+        if head_lines.length() > 0 {
+            status_parts := head_lines[0].split(' ');
+            if status_parts.length() >= 2 {
+                code := parse_status_code(status_parts[1]);
+                if code.is_value() {
+                    this.status_code_value = code?;
+                }
+            }
+        }
+
+        chunked := false;
+        i := 1;
+        while i < head_lines.length() {
+            line := String(head_lines[i]);
+            this.header_lines.push(line);
+
+            lower := to_lower_str(line);
+            if lower.starts_with("content-type:") {
+                this.content_type_value =
+                    String(line.substring(String("Content-Type:").length())?.trim());
+            } else if lower.starts_with("transfer-encoding:")
+                      && contains_substr(lower, String("chunked")) {
+                chunked = true;
+            }
+            i += 1;
+        }
+
+        if chunked {
+            this.body_value = dechunk(raw_body);
+        } else {
+            this.body_value = raw_body;
+        }
+    }
+
+    // --- Chain setters for an outbound response ---
+
+    /// Sets the status code and returns this response for chaining.
+    ///
+    /// @param status_code the HTTP status code
+    [mutates] fn status(status_code: int) => HttpResponse {
+        this.status_code_value = status_code;
+        return this;
+    }
+
+    /// Sets the content type and returns this response for chaining.
+    ///
+    /// @param content_type the MIME content type
+    [mutates] fn content_type(content_type: String) => HttpResponse {
+        this.content_type_value = content_type;
+        return this;
+    }
+
+    /// Adds a header line and returns this response for chaining.
+    ///
+    /// @param name the header name
+    /// @param value the header value
+    [mutates] fn header(name: String, value: String) => HttpResponse {
+        this.header_lines.push(`${name}: ${value}`);
+        return this;
+    }
+
+    /// Sets the response body and returns this response for chaining.
+    ///
+    /// @param body the response body
+    [mutates] fn body_content(body: String) => HttpResponse {
+        this.body_value = body;
+        return this;
+    }
+
+    // --- Accessors ---
+
+    /// Returns the status code.
+    fn status_code() => int {
+        return this.status_code_value;
+    }
+
+    /// Returns the status code.
+    fn get_status_code() => int {
+        return this.status_code_value;
+    }
+
+    /// Returns the content type.
+    fn get_content_type() => String {
+        return this.content_type_value;
+    }
+
+    /// Returns the de-chunked body for a parsed response, or the set body for
+    /// a built response.
+    fn body() => String {
+        return this.body_value;
+    }
+
+    /// Returns a header value by name from a parsed response.
+    /// The match is case-insensitive. Returns None when the header is absent.
+    ///
+    /// @param name the header name to look up
+    fn header_value(name: String) => String? {
+        search := `${name}:`;
+        search_lower := to_lower_str(String(search));
+        for line in this.header_lines {
+            if to_lower_str(String(line)).starts_with(search_lower) {
+                return String(line.substring(search.length())?.trim());
+            }
+        }
+        return None;
+    }
+
+    /// Serializes this response to its HTTP/1.1 wire form.
+    /// The status line uses a short reason phrase for common codes. A
+    /// Content-Type and Content-Length header are always emitted. Any headers
+    /// added with header() are included. Header lines end with CRLF.
+    fn get_response() => String {
+        if this.parsed_from_raw {
+            return this.raw_text;
+        }
+
+        out := String();
+        out.push("HTTP/1.1 ");
+        out.push(`${this.status_code_value}`);
+        out.push(" ");
+        out.push(reason_phrase(this.status_code_value));
+        out.push("\r\n");
+        out.push("Server: pekoweb\r\n");
+        out.push(`Content-Type: ${this.content_type_value}; charset=utf-8\r\n`);
+        out.push(`Content-Length: ${this.body_value.length()}\r\n`);
+
+        for line in this.header_lines {
+            out.push(line);
+            out.push("\r\n");
+        }
+
+        out.push("\r\n");
+        out.push(this.body_value);
+        return out;
+    }
+
+    [operator to_string]() => string {
+        return this.get_response() as string;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- RequestWriter ---
+// ---------------------------------------------------------------------------
+
+/// A writer for a streaming HTTP request body.
+///
+/// Returned by Request.open_stream(). The connection is open and the request
+/// line and headers (with Transfer-Encoding: chunked) have already been sent
+/// to the server. Each call to write() frames one body chunk on the wire.
+/// Call finish() to send the terminating chunk, read the full response, and
+/// close the connection. Call abort() to drop the connection without
+/// finishing.
+///
+/// Resource note: the underlying socket is held by an opaque malloc'd C
+/// handle that does not participate in GC. A writer that is dropped without
+/// finish() or abort() will leak the socket and any associated TLS state.
+/// Always pair open_stream() with a matching finish() or abort() call.
+///
+/// @example {
+/// writer := sockets::Request()
+///     .method("POST")
+///     .path("/upload")
+///     .header("Content-Type", "text/plain")
+///     .tls()
+///     .open_stream("api.example.com", 443)?;
+///
+/// writer.write("line one\n");
+/// writer.write("line two\n");
+/// response := writer.finish()?;
+/// console::println(`status ${response.get_status_code()}`);
+/// }
+class RequestWriter {
+    [private] handle:    opaque;
+    [private] is_tls:    bool;
+    [private] is_closed: bool;
+
+    /// Wraps an open streaming-request handle.
+    ///
+    /// @param handle the opaque handle returned by the C open function
+    /// @param is_tls true when the connection uses TLS
+    constructor(handle: opaque, is_tls: bool) {
+        this.handle    = handle;
+        this.is_tls    = is_tls;
+        this.is_closed = false;
+    }
+
+    /// Writes a chunk of body bytes through the open connection. Returns
+    /// true on success, false on a transport error or after the writer has
+    /// already been finished. A write of an empty string is a no-op.
+    ///
+    /// @param chunk the body bytes to send
+    [mutates] fn write(chunk: String) => bool {
+        if this.is_closed {
+            return false;
+        }
+
+        // A bytes-and-length pair is what the C side wants; pass the
+        // String as cstr (autoboxed) along with its length.
+        result := 0;
+        if this.is_tls {
+            result = extern::peko_stream_write_chunk_tls(
+                this.handle, chunk as string, chunk.length());
+        } else {
+            result = extern::peko_stream_write_chunk(
+                this.handle, chunk as string, chunk.length());
+        }
+
+        if result != 0 {
+            this.is_closed = true;
+            return false;
+        }
+        return true;
+    }
+
+    /// Sends the terminating zero-size chunk, reads the full response,
+    /// closes the connection, and returns the parsed HttpResponse.
+    /// Returns None on a transport error or when the writer has already
+    /// been finished or aborted.
+    [mutates] fn finish() => HttpResponse? {
+        if this.is_closed {
+            return None;
+        }
+
+        raw := String("");
+        if this.is_tls {
+            raw = String(extern::peko_stream_finish_tls(this.handle));
+        } else {
+            raw = String(extern::peko_stream_finish(this.handle));
+        }
+
+        this.is_closed = true;
+
+        if raw.length() == 0 || raw.starts_with("Error:") {
+            return None;
+        }
+
+        return HttpResponse(raw);
+    }
+
+    /// Closes the connection without writing a terminator and without
+    /// reading a response. For cleanup paths where the caller cannot
+    /// finish the stream.
+    [mutates] fn abort() {
+        if this.is_closed {
+            return;
+        }
+
+        if this.is_tls {
+            extern::peko_stream_abort_tls(this.handle);
+        } else {
+            extern::peko_stream_abort(this.handle);
+        }
+
+        this.is_closed = true;
+    }
+
+    /// Returns true after finish() or abort() has been called, or after a
+    /// transport error closed the writer. A closed writer rejects further
+    /// writes and finishes.
+    fn closed() => bool {
+        return this.is_closed;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// --- Request ---
+// ---------------------------------------------------------------------------
+
+/// A unified socket request that works over raw TCP, HTTP, and HTTPS.
+///
+/// Build a request with the chain setters, then call send() to transmit it.
+/// The same object covers all three transports: a request with no HTTP method
+/// set is sent as a raw TCP payload; a request with a method is serialized as
+/// an HTTP/1.1 message. Calling tls() routes send() over an encrypted TLS
+/// connection.
+///
+/// A Request can also wrap a raw request string received by a server. The
+/// accessor methods (get_method, get_path, get_body, get_header, get_field)
+/// parse that raw string on demand.
+///
+/// @example {
+/// resp := sockets::Request()
+///     .method("POST")
+///     .path("/v1/items")
+///     .header("Authorization", "Bearer token")
+///     .json(`{"name":"peko"}`)
+///     .tls()
+///     .send("api.example.com", 443)?;
+///
+/// body := resp.body();
+/// }
+class Request {
+    [private] method_value:  String;
+    [private] path_value:    String;
+    [private] header_lines:  Array<String>;
+    [private] body_value:    String;
+    [private] secure_value:  bool;
+    [private] http_version:  String;
+    [private] raw_value:     String;
+    [private] has_raw:       bool;
+
+    /// Creates an empty request.
+    /// The HTTP version defaults to 1.1 and the connection is not secured.
+    constructor() {
+        this.method_value = String("");
+        this.path_value   = String("/");
+        this.header_lines = Array<String>();
+        this.body_value   = String("");
+        this.secure_value = false;
+        this.http_version = String("1.1");
+        this.raw_value    = String("");
+        this.has_raw      = false;
+    }
+
+    /// Creates a request that wraps a raw request string.
+    /// Servers use this to hand a received request to a callback.
+    ///
+    /// @param content the raw request bytes
+    constructor(content: String) {
+        this.method_value = String("");
+        this.path_value   = String("/");
+        this.header_lines = Array<String>();
+        this.body_value   = String("");
+        this.secure_value = false;
+        this.http_version = String("1.1");
+        this.raw_value    = content;
+        this.has_raw      = true;
+    }
+
+    // --- Chain setters ---
+
+    /// Sets the HTTP method and returns this request for chaining.
+    ///
+    /// @param method the HTTP method such as GET or POST
+    [mutates] fn method(method: String) => Request {
+        this.method_value = method;
+        this.has_raw      = false;
+        return this;
+    }
+
+    /// Sets the request path and returns this request for chaining.
+    ///
+    /// @param path the request path
+    [mutates] fn path(path: String) => Request {
+        this.path_value = path;
+        this.has_raw    = false;
+        return this;
+    }
+
+    /// Adds a header line and returns this request for chaining.
+    /// Repeated names produce repeated header lines.
+    ///
+    /// @param name the header name
+    /// @param value the header value
+    [mutates] fn header(name: String, value: String) => Request {
+        this.header_lines.push(`${name}: ${value}`);
+        this.has_raw = false;
+        return this;
+    }
+
+    /// Sets the request body and returns this request for chaining.
+    ///
+    /// @param body the request body
+    [mutates] fn body(body: String) => Request {
+        this.body_value = body;
+        this.has_raw    = false;
+        return this;
+    }
+
+    /// Sets a Content-Type header and the body, then returns this request.
+    ///
+    /// @param mime the MIME content type
+    /// @param body the request body
+    [mutates] fn content(mime: String, body: String) => Request {
+        this.header(String("Content-Type"), mime);
+        this.body_value = body;
+        this.has_raw    = false;
+        return this;
+    }
+
+    /// Sets a JSON body with the matching Content-Type, then returns this.
+    ///
+    /// @param body the JSON body
+    [mutates] fn json(body: String) => Request {
+        return this.content(String("application/json"), body);
+    }
+
+    /// Sets a plain-text body with the matching Content-Type, then returns this.
+    ///
+    /// @param body the text body
+    [mutates] fn text(body: String) => Request {
+        return this.content(String("text/plain"), body);
+    }
+
+    /// Routes send() over an encrypted TLS connection and returns this.
+    ///
+    /// SECURITY NOTE: the TLS layer does not verify server certificates. The
+    /// connection is encrypted but not authenticated, so it is open to
+    /// man-in-the-middle attacks. Use it only for non-sensitive data such as
+    /// public APIs.
+    [mutates] fn tls() => Request {
+        this.secure_value = true;
+        return this;
+    }
+
+    /// Sets whether send() uses TLS and returns this request for chaining.
+    ///
+    /// @param secure true to send over TLS
+    [mutates] fn secure(secure: bool) => Request {
+        this.secure_value = secure;
+        return this;
+    }
+
+    /// Sets the HTTP version token and returns this request for chaining.
+    ///
+    /// @param version the version token such as 1.0 or 1.1
+    [mutates] fn version(version: String) => Request {
+        this.http_version = version;
+        this.has_raw      = false;
+        return this;
+    }
+
+    // --- Serialization ---
+
+    /// Returns true if this request carries an HTTP method.
+    fn is_http() => bool {
+        return this.method_value.length() > 0;
+    }
+
+    /// Returns true if send() will use TLS.
+    fn is_secure() => bool {
+        return this.secure_value;
+    }
+
+    /// Returns whether the named header was set on this request.
+    ///
+    /// @param name the header name
+    [private] fn has_header(name: String) => bool {
+        prefix := `${name}:`;
+        lowered := to_lower_str(String(prefix));
+        for line in this.header_lines {
+            if to_lower_str(String(line)).starts_with(lowered) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Serializes this request to its wire form.
+    /// A request with an HTTP method is serialized as an HTTP/1.1 message with
+    /// a request line, the set headers, an automatic Content-Length when a body
+    /// is present, an automatic Host header for the given host, and the body.
+    /// A request with no method returns the body unchanged for raw TCP.
+    ///
+    /// @param host the destination host, used for the automatic Host header
+    fn serialize(host: String) => String {
+        if this.has_raw {
+            return this.raw_value;
+        }
+
+        if !this.is_http() {
+            return this.body_value;
+        }
+
+        out := String();
+        out.push(this.method_value);
+        out.push(" ");
+        out.push(this.path_value);
+        out.push(" HTTP/");
+        out.push(this.http_version);
+        out.push("\r\n");
+
+        if !this.has_header(String("Host")) {
+            out.push(`Host: ${host}\r\n`);
+        }
+
+        for line in this.header_lines {
+            out.push(line);
+            out.push("\r\n");
+        }
+
+        if this.body_value.length() > 0 && !this.has_header(String("Content-Length")) {
+            out.push(`Content-Length: ${this.body_value.length()}\r\n`);
+        }
+
+        if !this.has_header(String("Connection")) {
+            out.push("Connection: close\r\n");
+        }
+
+        if !this.has_header(String("User-Agent")) {
+            out.push("User-Agent: peko-sockets/1.0\r\n");
+        }
+
+        out.push("\r\n");
+        out.push(this.body_value);
+        return out;
+    }
+
+    // --- Sending ---
+
+    /// Serializes and sends this request to host on port, then returns the
+    /// parsed response. Returns None when the transport reports an error or an
+    /// empty reply.
+    ///
+    /// @param host the host to connect to
+    /// @param port the port to connect to
+    fn send(host: String, port: int) => Response? {
+        wire := this.serialize(host);
+        result := String("");
+        if this.secure_value {
+            result = String(extern::peko_create_request_tls(host as string, port, wire as string));
+        } else {
+            result = String(extern::peko_create_request(host as string, port, wire as string));
+        }
+        if result.length() == 0 || result.starts_with("Error:") {
+            return None;
+        }
+        return Response(result);
+    }
+
+    /// Serializes and sends this request, then returns the raw transport result
+    /// without filtering. An empty string means the peer sent no data. A string
+    /// starting with "Error:" carries the transport error text. Any other value
+    /// is the full raw response.
+    ///
+    /// @param host the host to connect to
+    /// @param port the port to connect to
+    fn send_raw(host: String, port: int) => String {
+        wire := this.serialize(host);
+        if this.secure_value {
+            return String(extern::peko_create_request_tls(host as string, port, wire as string));
+        }
+        return String(extern::peko_create_request(host as string, port, wire as string));
+    }
+
+    /// Serializes and sends this request using the default port for the
+    /// transport: 443 when TLS is enabled, 80 otherwise.
+    ///
+    /// @param host the host to connect to
+    fn send(host: String) => Response? {
+        if this.secure_value {
+            return this.send(host, 443);
+        }
+        return this.send(host, 80);
+    }
+
+    /// Serializes and sends this request, then returns the parsed HttpResponse.
+    /// Returns None when the transport reports an error or an empty reply.
+    ///
+    /// @example {
+    /// http := sockets::Request().method("GET").path("/").tls()
+    ///     .send_http("example.com", 443)?;
+    /// status := http.status_code();
+    /// body   := http.body();
+    /// }
+    ///
+    /// @param host the host to connect to
+    /// @param port the port to connect to
+    fn send_http(host: String, port: int) => HttpResponse? {
+        response := this.send(host, port);
+        if !response.is_value() {
+            return None;
+        }
+        raw := response?.get_response();
+        return HttpResponse(raw);
+    }
+
+    /// Serializes and sends this request using the default port for the
+    /// transport, then returns the parsed HttpResponse.
+    ///
+    /// @param host the host to connect to
+    fn send_http(host: String) => HttpResponse? {
+        if this.secure_value {
+            return this.send_http(host, 443);
+        }
+        return this.send_http(host, 80);
+    }
+
+    /// Sends this request on a new thread and does not wait for a response.
+    ///
+    /// @param host the host to connect to
+    /// @param port the port to connect to
+    fn send_no_response(host: String, port: int) {
+        wire   := this.serialize(host);
+        secure := this.secure_value;
+        threads::new_thread(closure[wire, host, port, secure]() {
+            if secure {
+                extern::peko_create_request_tls(host as string, port, wire as string);
+            } else {
+                extern::peko_create_request(host as string, port, wire as string);
+            }
+        });
+    }
+
+    /// Sends this request on a new thread using the default port for the
+    /// transport and does not wait for a response.
+    ///
+    /// @param host the host to connect to
+    fn send_no_response(host: String) {
+        if this.secure_value {
+            this.send_no_response(host, 443);
+        } else {
+            this.send_no_response(host, 80);
+        }
+    }
+
+    // --- Streaming ---
+
+    /// Serializes and sends this request, then reads the response
+    /// incrementally. on_headers is called once with a parsed HttpResponse
+    /// that carries the status line and response headers (no body yet).
+    /// Returning false from on_headers stops the read before any body bytes.
+    /// on_chunk is called repeatedly with each chunk of body bytes. Chunked
+    /// transfer encoding is de-framed before the callback sees the bytes.
+    /// Returning false from on_chunk stops the read. Returns true when the
+    /// stream finishes cleanly (server closed, terminating chunk, or callback
+    /// stopped) or false on a transport error.
+    ///
+    /// @example {
+    /// ok := sockets::Request().method("GET").path("/stream/20").tls()
+    ///     .stream("httpbin.org", 443,
+    ///         closure(resp: sockets::HttpResponse) => bool {
+    ///             console::println(`stream begin status ${resp.get_status_code()}`);
+    ///             return true;
+    ///         },
+    ///         closure(chunk: String) => bool {
+    ///             console::print(chunk);
+    ///             return true;
+    ///         });
+    /// }
+    ///
+    /// @param host the host to connect to
+    /// @param port the port to connect to
+    /// @param on_headers callback invoked once with the parsed response headers
+    /// @param on_chunk callback invoked per body chunk
+    fn stream(host: String, port: int,
+              on_headers: closure(HttpResponse) => bool,
+              on_chunk:   closure(String) => bool) => bool {
+        wire := this.serialize(host);
+
+        headers_trampoline := closure[on_headers](raw: cstr) => int {
+            response := HttpResponse(String(raw as string));
+            keep_going := on_headers(response);
+            if keep_going {
+                return 0;
+            }
+            return 1;
+        };
+
+        chunk_trampoline := closure[on_chunk](bytes: cstr, len: int) => bool {
+            chunk := String(bytes as string);
+            return on_chunk(chunk);
+        };
+
+        result := 0;
+        if this.secure_value {
+            result = extern::peko_stream_request_tls(
+                host as string, port, wire as string,
+                headers_trampoline.function, headers_trampoline.context,
+                chunk_trampoline.function,   chunk_trampoline.context);
+        } else {
+            result = extern::peko_stream_request(
+                host as string, port, wire as string,
+                headers_trampoline.function, headers_trampoline.context,
+                chunk_trampoline.function,   chunk_trampoline.context);
+        }
+        return result == 0;
+    }
+
+    /// Streams this request using the default port for the transport: 443
+    /// when TLS is enabled, 80 otherwise.
+    ///
+    /// @param host the host to connect to
+    /// @param on_headers callback invoked once with the parsed response headers
+    /// @param on_chunk callback invoked per body chunk
+    fn stream(host: String,
+              on_headers: closure(HttpResponse) => bool,
+              on_chunk:   closure(String) => bool) => bool {
+        if this.secure_value {
+            return this.stream(host, 443, on_headers, on_chunk);
+        }
+        return this.stream(host, 80, on_headers, on_chunk);
+    }
+
+    /// Streams this request and parses the response body as Server-Sent
+    /// Events (text/event-stream). on_event is called once per complete event
+    /// with the event's data payload (the text after "data: " concatenated
+    /// across continuation lines, with the final blank line stripped). The
+    /// SSE event name and id fields are not exposed; this helper covers the
+    /// common case where only the data payload matters (LLM token streams,
+    /// status feeds). For full SSE semantics use stream() directly and parse
+    /// the chunks yourself.
+    ///
+    /// Returns true on a clean end-of-stream, false on transport error.
+    ///
+    /// @param host the host to connect to
+    /// @param port the port to connect to
+    /// @param on_headers callback invoked once with the response headers
+    /// @param on_event callback invoked once per complete SSE event
+    fn stream_sse(host: String, port: int,
+                  on_headers: closure(HttpResponse) => bool,
+                  on_event:   closure(String) => bool) => bool {
+        // The accumulator carries state across chunk callbacks. The closure
+        // captures the object reference; methods on the captured object see
+        // and update the same buffer between invocations.
+        accumulator := SseBuffer();
+
+        chunk_handler := closure[accumulator, on_event](chunk: String) => bool {
+            accumulator.push_chunk(chunk);
+
+            while true {
+                event_text := accumulator.take_event();
+                if !event_text.is_value() {
+                    break;
+                }
+
+                data := extract_sse_data(event_text?);
+                if data.length() > 0 {
+                    if !on_event(data) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+
+        return this.stream(host, port, on_headers, chunk_handler);
+    }
+
+    /// Streams an SSE request using the default port for the transport.
+    ///
+    /// @param host the host to connect to
+    /// @param on_headers callback invoked once with the response headers
+    /// @param on_event callback invoked once per complete SSE event
+    fn stream_sse(host: String,
+                  on_headers: closure(HttpResponse) => bool,
+                  on_event:   closure(String) => bool) => bool {
+        if this.secure_value {
+            return this.stream_sse(host, 443, on_headers, on_event);
+        }
+        return this.stream_sse(host, 80, on_headers, on_event);
+    }
+
+    // --- Send-streaming ---
+
+    /// Builds the request head for a send-streaming request: the request
+    /// line followed by the user-supplied headers, each terminated by CRLF.
+    /// Connection: close is appended unless the user set a Connection header.
+    /// Content-Length is intentionally omitted; the C side appends a
+    /// Transfer-Encoding: chunked header and the blank line that ends the
+    /// header block. The body is not included; chunks are sent through the
+    /// writer after this head is on the wire.
+    ///
+    /// @param host the destination host, used for the automatic Host header
+    [private] fn serialize_head(host: String) => String {
+        out := String();
+        out.push(this.method_value as string);
+        out.push(" ");
+        out.push(this.path_value as string);
+        out.push(" HTTP/");
+        out.push(this.http_version as string);
+        out.push("\r\n");
+
+        if !this.has_header(String("Host")) {
+            out.push(`Host: ${host}\r\n`);
+        }
+
+        for line in this.header_lines {
+            out.push(line as string);
+            out.push("\r\n");
+        }
+
+        if !this.has_header(String("Connection")) {
+            out.push("Connection: close\r\n");
+        }
+
+        if !this.has_header(String("User-Agent")) {
+            out.push("User-Agent: peko-sockets/1.0\r\n");
+        }
+
+        return out;
+    }
+
+    /// Opens a streaming request connection and returns a writer. The
+    /// request line and headers are sent immediately; the body is sent in
+    /// pieces by calling write() on the returned writer. Call finish() to
+    /// send the terminating chunk and read the response, or abort() to drop
+    /// the connection.
+    ///
+    /// A request opened with open_stream must have a method set (it must be
+    /// an HTTP request). Plain TCP send-streaming is not framed; use raw
+    /// send() for that case.
+    ///
+    /// Returns None when the connection cannot be opened.
+    ///
+    /// @example {
+    /// writer := sockets::Request()
+    ///     .method("POST")
+    ///     .path("/upload")
+    ///     .header("Content-Type", "application/octet-stream")
+    ///     .tls()
+    ///     .open_stream("api.example.com", 443)?;
+    ///
+    /// writer.write("first chunk");
+    /// writer.write("second chunk");
+    /// response := writer.finish()?;
+    /// console::println(`status ${response.get_status_code()}`);
+    /// }
+    ///
+    /// @param host the host to connect to
+    /// @param port the port to connect to
+    fn open_stream(host: String, port: int) => RequestWriter? {
+        if !this.is_http() {
+            return None;
+        }
+
+        head := this.serialize_head(host);
+        handle: opaque = null;
+        if this.secure_value {
+            handle = extern::peko_open_stream_request_tls(
+                host as string, port, head as string);
+        } else {
+            handle = extern::peko_open_stream_request(
+                host as string, port, head as string);
+        }
+
+        if handle == null {
+            return None;
+        }
+
+        return RequestWriter(handle, this.secure_value);
+    }
+
+    /// Opens a streaming request using the default port for the transport.
+    ///
+    /// @param host the host to connect to
+    fn open_stream(host: String) => RequestWriter? {
+        if this.secure_value {
+            return this.open_stream(host, 443);
+        }
+        return this.open_stream(host, 80);
+    }
+
+    // --- Accessors for a wrapped raw request ---
+
+    /// Returns the full raw request bytes.
+    /// For a built request this serializes with an empty host.
+    fn get_request() => String {
+        if this.has_raw {
+            return this.raw_value;
+        }
+        return this.serialize(String(""));
+    }
+
+    /// Returns the request body.
+    /// For a wrapped raw request this is the content after the blank line.
+    fn get_body() => String {
+        if this.has_raw {
+            split := split_head_body(this.raw_value);
+            return split[1];
+        }
+        return this.body_value;
+    }
+
+    /// Returns the HTTP method of a wrapped raw request, or the set method.
+    fn get_method() => String {
+        if !this.has_raw {
+            return this.method_value;
+        }
+        first_line := this.raw_value.split("\r\n")[0];
+        parts := first_line.split(" ");
+        if parts.length() == 0 {
+            return String("");
+        }
+        return parts[0];
+    }
+
+    /// Returns the request path of a wrapped raw request, or the set path.
+    fn get_path() => String {
+        if !this.has_raw {
+            return this.path_value;
+        }
+        first_line := this.raw_value.split("\r\n")[0];
+        parts := first_line.split(" ");
+        if parts.length() < 2 {
+            return String("");
+        }
+        return parts[1];
+    }
+
+    /// Returns a named header value from a wrapped raw request.
+    /// Returns None when the header is absent.
+    ///
+    /// @param name the header name to look up
+    fn get_header(name: String) => String? {
+        source := this.get_request();
+        lines := source.split("\r\n");
+        search := `${name}:`;
+        search_lower := to_lower_str(String(search));
+        i := 1;
+        while i < lines.length() {
+            line := lines[i];
+            if to_lower_str(String(line)).starts_with(search_lower) {
+                return String(line.substring(search.length())?.trim());
+            }
+            i += 1;
+        }
+        return None;
+    }
+
+    /// Returns a named field from a URL-encoded request body.
+    /// Multipart bodies are normalized to URL-encoded form by the server
+    /// before the request reaches a callback.
+    /// Returns None when the field is absent.
+    ///
+    /// @param name the field name to look up
+    fn get_field(name: String) => String? {
+        body := this.get_body();
+        pairs := body.split("&");
+        for pair in pairs {
+            kv := pair.lsplit('=');
+            if kv.length() >= 2 {
+                key := url_decode(kv[0]);
+                if key == name {
+                    return url_decode(kv[1]);
+                }
+            }
+        }
+        return None;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- HttpRequest ---
+// ---------------------------------------------------------------------------
+
+/// An HTTP request with parsed access to the method, path, query arguments,
+/// headers, and body.
+///
+/// A server builds an HttpRequest from a received raw request and hands it to
+/// a route handler. The query string and headers are parsed once at
+/// construction so handlers can read them by name. HttpRequest inherits the
+/// Request chain setters and send methods, so the same type also builds
+/// outbound HTTP requests.
+class HttpRequest from Request {
+    [private] req_type:      String;
+    [private] req_uri:       String;
+    [private] headers_map:   Map<String, String>;
+    [private] url_arguments: Map<String, String>;
+
+    /// Builds an HttpRequest by parsing a raw request string.
+    ///
+    /// @param content the raw request bytes
+    constructor(content: String) => super(content) {
+        this.req_type      = String("");
+        this.req_uri       = String("/");
+        this.headers_map   = Map<String, String>();
+        this.url_arguments = Map<String, String>();
+
+        request_lines := content.split('\n');
+
+        first_line := request_lines[0];
+        first_line_split := first_line.split(' ');
+
+        this.req_type = first_line_split[0];
+
+        if first_line_split.length() >= 2 {
+            route := first_line_split[1].lsplit('?');
+            this.req_uri = route[0];
+
+            if route.length() > 1 {
+                arguments := route[1].split('&');
+                for argument in arguments {
+                    key_value := argument.lsplit('=');
+                    if key_value.length() >= 2 {
+                        this.url_arguments.insert(url_decode(key_value[0]),
+                                                  url_decode(key_value[1]));
+                    } else if key_value.length() == 1 {
+                        this.url_arguments.insert(url_decode(key_value[0]),
+                                                  String(""));
+                    }
+                }
+            }
+        }
+
+        line_index := 1;
+        while line_index < request_lines.length()
+              && request_lines[line_index] != "\r" {
+            key_value := request_lines[line_index].lsplit(':');
+            if key_value.length() >= 2 {
+                value := key_value[1];
+                while value.length() > 0 && value[0] == ' ' {
+                    value.remove(0);
+                }
+                while value.length() > 0 && value[value.length() - 1] == '\r' {
+                    value.remove(value.length() - 1);
+                }
+                this.headers_map.insert(key_value[0], value);
+            }
+            line_index += 1;
+        }
+    }
+
+    /// Returns the request method such as GET or POST.
+    ///
+    /// @example {
+    /// fn handle(req: sockets::HttpRequest) {
+    ///     if req.request_type() == "POST" {
+    ///         console::println("post request");
+    ///     }
+    /// }
+    /// }
+    fn request_type() => String {
+        return this.req_type;
+    }
+
+    /// Returns the request URI without the query string.
+    fn uri() => String {
+        return this.req_uri;
+    }
+
+    /// Returns a query-string argument by name.
+    /// Returns None when the argument is absent.
+    ///
+    /// @param url_argument the argument name to look up
+    fn get(url_argument: String) => String? {
+        return this.url_arguments[url_argument];
+    }
+
+    /// Returns a header value by name from the parsed header map.
+    /// Returns None when the header is absent.
+    ///
+    /// @param header the header name to look up
+    fn get_header(header: String) => String? {
+        return this.headers_map[header];
+    }
+
+    /// Returns the request body. When the request used Transfer-Encoding:
+    /// chunked the body is de-framed before return, so the caller sees the
+    /// reassembled body bytes rather than the chunk-size lines and trailers.
+    /// Falls back to the plain body when no chunked encoding is present.
+    fn get_body() => String {
+        raw      := this.get_request();
+        split    := split_head_body(raw);
+        head     := split[0];
+        raw_body := split[1];
+
+        // Detect chunked encoding by scanning the request head for a
+        // Transfer-Encoding header whose value contains chunked. The check
+        // is per line and case-insensitive so any header capitalization
+        // matches and a stray "chunked" elsewhere in the head is ignored.
+        is_chunked := false;
+        head_lines := head.split('\n');
+        for raw_line in head_lines {
+            line := String(raw_line);
+            while line.length() > 0 && line[line.length() - 1] == '\r' {
+                line.remove(line.length() - 1);
+            }
+            lower := to_lower_str(line);
+            if lower.starts_with("transfer-encoding:")
+               && contains_substr(lower, String("chunked")) {
+                is_chunked = true;
+                break;
+            }
+        }
+
+        if is_chunked {
+            return dechunk(raw_body);
+        }
+
+        return raw_body;
+    }
+
+    [operator []](index: String) => String? {
+        return this.url_arguments[index];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- Client ---
+// ---------------------------------------------------------------------------
+
+/// A simple TCP client bound to a host and port.
+class Client {
+    [private] server_address: String;
+    [private] port: int;
+
+    /// Creates a client for the given server.
+    ///
+    /// @param server_address the server host
+    /// @param port the server port
+    constructor(server_address: String, port: int) {
+        this.server_address = server_address;
+        this.port = port;
+    }
+
+    /// Returns the server host.
+    fn get_server_address() => String {
+        return this.server_address;
+    }
+
+    /// Returns the server port.
+    fn get_port() => int {
+        return this.port;
+    }
+
+    /// Sends a request to the server and waits for a response.
+    /// Returns None when the request fails.
+    ///
+    /// @param request the request to send
+    fn request(request: Request) => Response? {
+        return request.send(this.server_address, this.port);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- Socket (raw TCP server) ---
+// ---------------------------------------------------------------------------
+
+/// A TCP socket server.
+/// Serves multiple simultaneous clients through the threads package.
+/// Setting the port to 0 before listening selects a random open port.
+class Socket {
+    [private] port: int;
+    [private] callback: closure(Request) => Response;
+    [private] run: bool;
+    [private] listen_socket: int;
+
+    /// Creates a socket bound to the given port.
+    ///
+    /// @param port the port to bind to
+    constructor(port: int) {
+        this.port = port;
+        this.run = false;
+        this.listen_socket = 0;
+        this.callback = closure(req: Request) => Response {
+            return Response("");
+        };
+    }
+
+    /// Creates a socket bound to the given port with a request callback.
+    ///
+    /// @param port the port to bind to
+    /// @param callback the callback to invoke per request
+    constructor(port: int, callback: closure(Request) => Response) {
+        this.port = port;
+        this.callback = callback;
+        this.run = false;
+        this.listen_socket = 0;
+    }
+
+    /// Creates a socket bound to port 0.
+    constructor() {
+        this.port = 0;
+        this.run = false;
+        this.listen_socket = 0;
+        this.callback = closure(req: Request) => Response {
+            return Response("");
+        };
+    }
+
+    /// Creates a socket bound to port 0 with a request callback.
+    ///
+    /// @param callback the callback to invoke per request
+    constructor(callback: closure(Request) => Response) {
+        this.port = 0;
+        this.callback = callback;
+        this.run = false;
+        this.listen_socket = 0;
+    }
+
+    /// Sets the request callback.
+    ///
+    /// @param callback the callback to invoke per request
+    [mutates] fn set_callback(callback: closure(Request) => Response) {
+        this.callback = callback;
+    }
+
+    /// Sets the port to bind to.
+    ///
+    /// @param port the port to bind to
+    [mutates] fn set_port(port: int) {
+        this.port = port;
+    }
+
+    /// Returns the bound port.
+    fn get_port() => int {
+        return this.port;
+    }
+
+    /// Runs the server on the current thread and blocks.
+    /// Each accepted connection is dispatched to a new thread so multiple
+    /// clients are served at once.
+    /// Returns false when the listen socket could not be created.
+    fn listen_attached() => bool {
+        socket_result := extern::peko_create_listen_socket(&this.port);
+        // A valid listening descriptor is always positive. PEKO_INVALID_SOCKET
+        // maps to -1 as an int, and a failed bind yields a non-positive value,
+        // so treat anything at or below 0 as failure.
+        if socket_result <= 0 {
+            return false;
+        }
+        this.listen_socket = socket_result;
+        this.run = true;
+
+        binded_callback := closure[this](str: cstr) => cstr {
+            // Bind the stored callback to a local before invoking it. Reading
+            // this.callback into a local materializes the closure's captured
+            // environment when the handler runs on the accept thread.
+            callback := this.callback;
+            return callback(Request(str as string)).get_response() as string;
+        };
+
+        while this.run {
+            extern::peko_accept_connection(
+                this.listen_socket,
+                binded_callback.function,
+                binded_callback.context
+            );
+        }
+
+        return true;
+    }
+
+    /// Runs the server on a new thread and returns immediately.
+    fn listen() {
+        threads::new_thread(closure[this]() {
+            this.listen_attached();
+        });
+    }
+
+    /// Stops the server.
+    [mutates] fn stop() {
+        this.run = false;
+    }
+}
+
+/// Opens a TCP socket on the given port with the given callback.
+///
+/// @param port the port to bind to
+/// @param callback the callback to invoke per request
+fn open_socket(port: int, callback: closure(Request) => Response) {
+    socket := Socket(port, callback);
+    socket.listen();
+}
+
+// ---------------------------------------------------------------------------
+// --- HttpSocket (HTTP server) ---
+// ---------------------------------------------------------------------------
+
+/// An HTTP server.
+/// Serves multiple simultaneous clients through the threads package.
+/// Setting the port to 0 selects a random open port when listening.
+class HttpSocket {
+    [private] socket: Socket;
+    [private] routes: Map<String, closure(HttpRequest) => HttpResponse>;
+    [private] current_route: String;
+
+    /// Creates an HTTP server bound to the given port.
+    ///
+    /// @param port the port to bind to
+    constructor(port: int) {
+        this.socket = Socket(port, closure[this](request: Request) => Response {
+            return this.handle_request(request);
+        });
+        this.routes = Map<String, closure(HttpRequest) => HttpResponse>();
+        this.current_route = String("/");
+    }
+
+    /// Creates an HTTP server bound to port 0.
+    constructor() {
+        this.socket = Socket(0, closure[this](request: Request) => Response {
+            return this.handle_request(request);
+        });
+        this.routes = Map<String, closure(HttpRequest) => HttpResponse>();
+        this.current_route = String("/");
+    }
+
+    /// Returns the most recently routed URI.
+    fn get_current_route() => String {
+        return this.current_route;
+    }
+
+    /// Routes a handler to a URI path.
+    ///
+    /// @example {
+    /// server := sockets::HttpSocket(8080);
+    /// server.route("/", closure(req: sockets::HttpRequest) => sockets::HttpResponse {
+    ///     return sockets::HttpResponse("<h1>Hello World</h1>", 200);
+    /// });
+    /// server.listen();
+    /// }
+    ///
+    /// @param url the route path
+    /// @param handler the handler for the route
+    [mutates] fn route(url: String, handler: closure(HttpRequest) => HttpResponse) {
+        this.routes.insert(url, handler);
+    }
+
+    /// Runs the server on the current thread and blocks.
+    fn listen_attached() {
+        this.socket.listen_attached();
+    }
+
+    /// Runs the server on a new thread and returns immediately.
+    fn listen() {
+        this.socket.listen();
+    }
+
+    /// Returns the bound port.
+    fn get_port() => int {
+        return this.socket.get_port();
+    }
+
+    [private] fn handle_request(request: Request) => Response {
+        http_request := HttpRequest(request.get_request());
+        uri := http_request.uri();
+
+        if !this.routes.contains(uri) {
+            return HttpResponse("<h1>404 Page Not Found</h1>", 404);
+        }
+
+        this.current_route = uri;
+        return this.routes[uri](http_request);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- WebSocket ---
+// ---------------------------------------------------------------------------
+
+/// A WebSocket server connection.
+/// Serves multiple simultaneous clients through the threads package.
+/// Setting the port to 0 selects a random open port when listening.
+///
+/// Reading and writing are decoupled: the message handler runs on the receive
+/// thread while a dedicated write thread drains a buffered channel. This keeps
+/// TCP send-buffer backpressure from stalling the receive loop, which would
+/// deadlock when a client sends faster than the server writes.
+class WebSocket {
+    [private] port:         int;
+    [private] callback:     closure(WebSocket, Request);
+    [private] run:          bool;
+    [private] socket:       int;
+    [private] listen_socket: int;
+    [private] send_channel: threads::Channel<String>;
+
+    /// Creates a websocket bound to port 0.
+    constructor() {
+        this.port         = 0;
+        this.callback     = closure(ws: WebSocket, req: Request) {};
+        this.run          = false;
+        this.socket       = 0;
+        this.listen_socket = 0;
+        this.send_channel = threads::Channel<String>(256);
+    }
+
+    /// Creates a websocket bound to port 0 with a message callback.
+    ///
+    /// @param callback the callback to invoke per message
+    constructor(callback: closure(WebSocket, Request)) {
+        this.port         = 0;
+        this.callback     = callback;
+        this.run          = false;
+        this.socket       = 0;
+        this.listen_socket = 0;
+        this.send_channel = threads::Channel<String>(256);
+    }
+
+    /// Creates a websocket bound to the given port.
+    ///
+    /// @param port the port to bind to
+    constructor(port: int) {
+        this.port         = port;
+        this.callback     = closure(ws: WebSocket, req: Request) {};
+        this.run          = false;
+        this.socket       = 0;
+        this.listen_socket = 0;
+        this.send_channel = threads::Channel<String>(256);
+    }
+
+    /// Creates a websocket bound to the given port with a message callback.
+    ///
+    /// @param port the port to bind to
+    /// @param callback the callback to invoke per message
+    constructor(port: int, callback: closure(WebSocket, Request)) {
+        this.port         = port;
+        this.callback     = callback;
+        this.run          = false;
+        this.socket       = 0;
+        this.listen_socket = 0;
+        this.send_channel = threads::Channel<String>(256);
+    }
+
+    /// Queues text to send to the connected client.
+    /// Returns false when the channel is full or closed.
+    ///
+    /// @param text the text to send
+    fn send(text: String) => bool {
+        return this.send_channel.send(text);
+    }
+
+    /// Queues text to send without blocking the caller.
+    ///
+    /// @param text the text to send
+    fn send_no_response(text: String) {
+        result := this.send_channel.try_send(text);
+    }
+
+    /// Queues text to send and returns whether it was accepted.
+    ///
+    /// @param text the text to send
+    fn try_send(text: String) => bool {
+        return this.send_channel.try_send(text);
+    }
+
+    /// Sets the message callback.
+    ///
+    /// @param callback the callback to invoke per message
+    [mutates] fn set_callback(callback: closure(WebSocket, Request)) {
+        this.callback = callback;
+    }
+
+    /// Sets the port to bind to.
+    ///
+    /// @param port the port to bind to
+    [mutates] fn set_port(port: int) {
+        this.port = port;
+    }
+
+    /// Returns the bound port.
+    fn get_port() => int {
+        return this.port;
+    }
+
+    /// Runs the server on the current thread and blocks.
+    /// Returns false when the listen socket could not be created.
+    fn listen_attached() => bool {
+        socket_result := extern::peko_create_listen_socket(&this.port);
+        // A valid listening descriptor is always positive. PEKO_INVALID_SOCKET
+        // maps to -1 as an int, and a failed bind yields a non-positive value,
+        // so treat anything at or below 0 as failure.
+        if socket_result <= 0 {
+            return false;
+        }
+        this.listen_socket = socket_result;
+        this.run = true;
+
+        while this.run {
+            current_channel := this.send_channel;
+
+            threads::new_thread(closure[this, current_channel]() {
+                // The C accept sets this.socket to the client fd as soon as the
+                // connection is established, so the write thread polls
+                // this.socket to learn when it can start sending. Waiting on a
+                // signal that only fires on the first inbound frame would stall
+                // forever for a connection that only ever receives, so queued
+                // messages would never be sent.
+                socket_fd := 0;
+                while socket_fd == 0 {
+                    socket_fd = this.socket;
+                    if socket_fd == 0 {
+                        threads::sleep_ms(1);
+                    }
+                }
+
+                while true {
+                    msg := current_channel.recv();
+                    if !msg.is_value() {
+                        break;
+                    }
+                    extern::pgc_begin_blocking();
+                    result := extern::peko_ws_send_text(socket_fd, msg? as string);
+                    extern::pgc_end_blocking();
+                }
+            });
+
+            // binded_callback runs on every inbound message. this.socket is set
+            // by the accept out-param on connect, so the handler dispatches the
+            // user callback for each message.
+            binded_callback_with_notify := closure[this](socket: int, str: cstr) {
+                this.socket = socket;
+                message := str as string;
+                // An empty message is the connection-setup signal that
+                // publishes the socket. A non-empty message is an inbound
+                // frame dispatched to the user callback.
+                if Runtime::length(message) > 0 {
+                    callback := this.callback;
+                    callback(this, Request(message));
+                }
+            };
+
+            extern::peko_ws_accept_connection(
+                this.listen_socket,
+                &this.socket,
+                binded_callback_with_notify.function,
+                binded_callback_with_notify.context
+            );
+
+            // The connection closed. Close the channel so the write thread
+            // exits, then install a fresh channel for the next connection.
+            current_channel.close();
+            this.send_channel = threads::Channel<String>(256);
+        }
+
+        return true;
+    }
+
+    /// Runs the server on a new thread and returns immediately.
+    fn listen() {
+        threads::new_thread(closure[this]() {
+            this.listen_attached();
+        });
+    }
+
+    /// Stops the server.
+    [mutates] fn stop() {
+        this.run = false;
+    }
+}
+
+/// Opens a websocket on the given port with the given callback.
+///
+/// @example {
+/// sockets::open_web_socket(3000, closure(ws: sockets::WebSocket, req: sockets::Request) {
+///     if req.get_request() == "Hello" {
+///         ws.send("Hi!");
+///     }
+/// });
+/// }
+///
+/// @param port the port to bind to
+/// @param callback the callback to invoke per message
+fn open_web_socket(port: int, callback: closure(WebSocket, Request)) {
+    threads::new_thread(closure[port, callback]() {
+        socket := WebSocket(port, callback);
+        socket.listen();
+    });
+}
+
+// ---------------------------------------------------------------------------
+// --- File download ---
+// ---------------------------------------------------------------------------
+
+/// Downloads the body of a GET request to a local file path.
+/// The HTTP response headers are stripped. The file is created or overwritten.
+/// Returns true on success.
+///
+/// @example {
+/// ok := sockets::download("example.com", "/files/data.zip", "/tmp/data.zip");
+/// }
+///
+/// @param host the host to connect to
+/// @param path the request path
+/// @param fpath the destination file path
+fn download(host: String, path: String, fpath: String) => bool {
+    request := `GET ${path} HTTP/1.0\r\nHost: ${host}\r\nConnection: close\r\n\r\n`;
+    return extern::peko_download_to_file(host as string, 80, request as string, fpath as string, 0) == 0;
+}
+
+/// Downloads the body of a GET request to a local file path on a custom port.
+/// Returns true on success.
+///
+/// @param host the host to connect to
+/// @param path the request path
+/// @param port the port to connect to
+/// @param fpath the destination file path
+fn download(host: String, path: String, port: int, fpath: String) => bool {
+    request := `GET ${path} HTTP/1.0\r\nHost: ${host}\r\nConnection: close\r\n\r\n`;
+    return extern::peko_download_to_file(host as string, port, request as string, fpath as string, 0) == 0;
+}
+
+/// Downloads the body of a GET request to a local file path.
+/// chunk_size sets how many bytes are read and written per iteration. Pass 0
+/// for the default chunk size.
+/// Returns true on success.
+///
+/// @param host the host to connect to
+/// @param path the request path
+/// @param fpath the destination file path
+/// @param chunk_size the bytes per read and write iteration
+fn download(host: String, path: String, fpath: String, chunk_size: int) => bool {
+    request := `GET ${path} HTTP/1.0\r\nHost: ${host}\r\nConnection: close\r\n\r\n`;
+    return extern::peko_download_to_file(host as string, 80, request as string, fpath as string, chunk_size) == 0;
+}
+
+/// Downloads the body of a GET request to a local file path on a custom port.
+/// chunk_size sets how many bytes are read and written per iteration. Pass 0
+/// for the default chunk size.
+/// Returns true on success.
+///
+/// @param host the host to connect to
+/// @param path the request path
+/// @param port the port to connect to
+/// @param fpath the destination file path
+/// @param chunk_size the bytes per read and write iteration
+fn download(host: String, path: String, port: int, fpath: String, chunk_size: int) => bool {
+    request := `GET ${path} HTTP/1.0\r\nHost: ${host}\r\nConnection: close\r\n\r\n`;
+    return extern::peko_download_to_file(host as string, port, request as string, fpath as string, chunk_size) == 0;
+}
+
+/// Downloads the body of a GET request to an fs::File.
+/// The file is created or overwritten. Returns true on success.
+///
+/// @example {
+/// dest := fs::File("/tmp/data.zip");
+/// ok := sockets::download_to_file("example.com", "/files/data.zip", dest);
+/// }
+///
+/// @param host the host to connect to
+/// @param path the request path
+/// @param dest the destination file
+fn download_to_file(host: String, path: String, dest: fs::File) => bool {
+    request := `GET ${path} HTTP/1.0\r\nHost: ${host}\r\nConnection: close\r\n\r\n`;
+    return extern::peko_download_to_file(host as string, 80, request as string, dest.path() as string, 0) == 0;
+}
+
+/// Downloads the body of a GET request to an fs::File on a custom port.
+/// Returns true on success.
+///
+/// @param host the host to connect to
+/// @param path the request path
+/// @param port the port to connect to
+/// @param dest the destination file
+fn download_to_file(host: String, path: String, port: int, dest: fs::File) => bool {
+    request := `GET ${path} HTTP/1.0\r\nHost: ${host}\r\nConnection: close\r\n\r\n`;
+    return extern::peko_download_to_file(host as string, port, request as string, dest.path() as string, 0) == 0;
+}

@@ -1,0 +1,766 @@
+//! Implements base runtime functionality for Pekoscript.
+//
+// Naming standards in this file differ from normal Peko conventions
+// since these functions are referenced directly by the compiler.
+
+import ffi@"v0.1.0";
+
+platform windows {
+    link libs::windows::rt as object;
+
+    link libs::windows::alloc as object;
+    link libs::windows::compiler_abi as object;
+    link libs::windows::heap as object;
+    link libs::windows::mark as object;
+    link libs::windows::pgc as object;
+    link libs::windows::roots as object;
+    link libs::windows::stackmap as object;
+    link libs::windows::threads as object;
+    link libs::windows::audit as object;
+}
+
+platform macos {
+    arch arm {
+        link libs::macos::arm::rt as object;
+
+        link libs::macos::arm::alloc as object;
+        link libs::macos::arm::compiler_abi as object;
+        link libs::macos::arm::heap as object;
+        link libs::macos::arm::mark as object;
+        link libs::macos::arm::pgc as object;
+        link libs::macos::arm::roots as object;
+        link libs::macos::arm::stackmap as object;
+        link libs::macos::arm::threads as object;
+        link libs::macos::arm::audit as object;
+    }
+
+    arch x86_64 {
+        link libs::macos::x86_64::rt as object;
+
+        link libs::macos::x86_64::alloc as object;
+        link libs::macos::x86_64::compiler_abi as object;
+        link libs::macos::x86_64::heap as object;
+        link libs::macos::x86_64::mark as object;
+        link libs::macos::x86_64::pgc as object;
+        link libs::macos::x86_64::roots as object;
+        link libs::macos::x86_64::stackmap as object;
+        link libs::macos::x86_64::threads as object;
+        link libs::macos::x86_64::audit as object;
+    }
+}
+
+platform linux {
+    arch arm {
+        link libs::linux::arm::rt as object;
+
+        link libs::linux::arm::alloc as object;
+        link libs::linux::arm::compiler_abi as object;
+        link libs::linux::arm::heap as object;
+        link libs::linux::arm::mark as object;
+        link libs::linux::arm::pgc as object;
+        link libs::linux::arm::roots as object;
+        link libs::linux::arm::stackmap as object;
+        link libs::linux::arm::threads as object;
+        link libs::linux::arm::audit as object;
+    }
+
+    arch x86_64 {
+        link libs::linux::x86_64::rt as object;
+
+        link libs::linux::x86_64::alloc as object;
+        link libs::linux::x86_64::compiler_abi as object;
+        link libs::linux::x86_64::heap as object;
+        link libs::linux::x86_64::mark as object;
+        link libs::linux::x86_64::pgc as object;
+        link libs::linux::x86_64::roots as object;
+        link libs::linux::x86_64::stackmap as object;
+        link libs::linux::x86_64::threads as object;
+        link libs::linux::x86_64::audit as object;
+    }
+}
+
+platform ios {
+    arch arm {
+        link libs::ios::arm::rt as object;
+
+        link libs::ios::arm::alloc as object;
+        link libs::ios::arm::compiler_abi as object;
+        link libs::ios::arm::heap as object;
+        link libs::ios::arm::mark as object;
+        link libs::ios::arm::pgc as object;
+        link libs::ios::arm::roots as object;
+        link libs::ios::arm::stackmap as object;
+        link libs::ios::arm::threads as object;
+        link libs::ios::arm::audit as object;
+    }
+
+    arch x86_64 {
+        link libs::ios::x86_64::rt as object;
+
+        link libs::ios::x86_64::alloc as object;
+        link libs::ios::x86_64::compiler_abi as object;
+        link libs::ios::x86_64::heap as object;
+        link libs::ios::x86_64::mark as object;
+        link libs::ios::x86_64::pgc as object;
+        link libs::ios::x86_64::roots as object;
+        link libs::ios::x86_64::stackmap as object;
+        link libs::ios::x86_64::threads as object;
+        link libs::ios::x86_64::audit as object;
+    }
+}
+
+platform android {
+    link libs::android::rt as object;
+
+    link libs::android::alloc as object;
+    link libs::android::compiler_abi as object;
+    link libs::android::heap as object;
+    link libs::android::mark as object;
+    link libs::android::pgc as object;
+    link libs::android::roots as object;
+    link libs::android::stackmap as object;
+    link libs::android::threads as object;
+    link libs::android::audit as object;
+
+    [external variadic] fn __android_log_write(sev: int, label: cstr, msg: cstr) => int;
+}
+
+// ---------------------------------------------------------------------------
+// --- Compiler-emitted GC ABI ---
+// ---------------------------------------------------------------------------
+
+/// Stores the source line of the current function call point.
+/// Set automatically by the compiler.
+[external] current_line: int = 0;
+
+/// Stores the source file of the current function call point.
+/// Set automatically by the compiler.
+[external] current_file: cstr = cstring("");
+
+// Compiler-emitted allocation and write-barrier ABI.
+// descriptor and slot parameters stay opaque (raw i8* at the C boundary).
+// Allocators return Pointer<void> so freshly-allocated objects are born
+// in managed address space 1, giving RewriteStatepointsForGC a clean
+// base pointer for each object.
+[external] fn peko_gc_alloc_object(descriptor: opaque, size: int) => Pointer<void>;
+[external] fn peko_gc_alloc(size: int) => Pointer<void>;
+[external] fn peko_gc_add_global_root(slot: opaque);
+[external] fn peko_gc_write_barrier(slot: opaque, value: opaque);
+
+// GC lifecycle - called from the main entry point.
+[external notrack] fn pgc_init(heap_bytes: int) => int;
+[external notrack] fn pgc_shutdown();
+[external notrack] fn pgc_thread_attach();
+[external notrack] fn pgc_thread_detach();
+
+// ---------------------------------------------------------------------------
+// --- Core allocation ---
+// ---------------------------------------------------------------------------
+
+/// Allocates a GC-managed array of T with the provided element count.
+/// Uses the compiler built-in __rt_peko_alloc which branches automatically:
+/// primitive T -> atomic buffer, managed T -> traced buffer with descriptor.
+///
+/// @param amount the number of elements to allocate
+fn Allocate<T>(amount: int) => Pointer<T> {
+    return __rt_peko_alloc<T>(amount);
+}
+
+// Raw C strlen that takes cstr - used by CreateManaged to avoid the implicit
+// cstr->string cast that would call CreateManaged recursively.
+[external] fn strlen(str: cstr) => int;
+[external] fn memcpy(dst: opaque, src: cstr, n: int);
+
+/// Creates a GC-managed string from a raw C string (cstr).
+/// Allocates a managed char buffer, copies the bytes, and null-terminates.
+///
+/// @param src the null-terminated C string to copy
+fn CreateManaged(src: cstr) => string {
+    len    := extern::strlen(src);
+    result := __rt_peko_alloc<char>(len + 1);
+    extern::memcpy(result, src, len + 1);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// --- Program exit ---
+// ---------------------------------------------------------------------------
+
+/// Exits the program with the provided exit code.
+///
+/// @param exit_code the code to exit with
+[blockexit] fn Exit(exit_code: int) {
+    extern::pgc_thread_detach();
+    extern::pgc_shutdown();
+    extern::exit(exit_code);
+}
+
+[external variadic] fn peko_printf(fmt: cstr) => int;
+
+/// Exits the program with an error message and exit code 134.
+///
+/// @param exit_message the message to print before exiting
+[blockexit notrack] fn Exit(exit_message: string) {
+    extern::peko_printf("Error on line %d in file '%s': %s\n",
+                   extern::current_line,
+                   extern::current_file,
+                   exit_message as cstr);
+    Exit(134);
+}
+
+platform windowsgui {
+    [external] fn windows_hide_console();
+
+    /// Hides the Windows console window. No-op on other platforms.
+    fn HideWindowsConsole() {
+        extern::windows_hide_console();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- Math helpers ---
+// ---------------------------------------------------------------------------
+
+/// Returns the length of a string.
+///
+/// @param str the string to measure
+fn length(str: string) => int {
+    return extern::strlen(str);
+}
+
+/// Returns the number of digits in an integer (including the minus sign).
+///
+/// @param num the integer to measure
+fn length(num: int) => int {
+    if num == 0 {
+        return 1;
+    }
+
+    len: int = num < 0;
+    if num < 0 {
+        num *= -1;
+    }
+
+    while num > 0 {
+        num /= 10;
+        len += 1;
+    }
+
+    return len;
+}
+
+/// Returns the number of characters a float would produce as a string.
+///
+/// @param num the float to measure
+fn length(num: float) => int {
+    if num == 0.0 {
+        return 3;
+    }
+
+    while num != (num as int) {
+        num *= 10;
+    }
+
+    extra_length: int = (num as int) == 0;
+    return length(num as int) + 1 + extra_length;
+}
+
+[external] fn powf(base: float, power: float) => float;
+
+/// Raises base to power. Used by the compiler for ^ operations.
+///
+/// @param base the base value
+/// @param power the exponent
+fn Exponential(base: float, power: float) => float {
+    return extern::powf(base, power);
+}
+
+[external] fn fmodf(base: float, power: float) => float;
+
+/// Computes the floating-point remainder. Used by the compiler for % operations.
+///
+/// @param lhs the dividend
+/// @param rhs the divisor
+fn Modulus(lhs: float, rhs: float) => float {
+    return extern::fmodf(lhs, rhs);
+}
+
+// ---------------------------------------------------------------------------
+// --- String operations ---
+// ---------------------------------------------------------------------------
+
+/// Concatenates two strings into a new GC-managed string.
+///
+/// @param str1 the first string
+/// @param str2 the string to append
+fn StringAdd(str1: string, str2: string) => string {
+    if str1 == "" {
+        return str2;
+    } else if str2 == "" {
+        return str1;
+    }
+
+    str1_length := length(str1);
+    str2_length := length(str2);
+    result      := Allocate<char>(str1_length + str2_length + 1);
+
+    extern::memcpy(result, str1, str1_length);
+    extern::memcpy(&result[str1_length], str2, str2_length + 1);
+
+    result[str1_length + str2_length] = 0;
+    return result;
+}
+
+/// Returns a new string with the character at index removed.
+///
+/// @param str the source string
+/// @param index the index of the character to remove
+fn StringRemove(str: string, index: int) => string {
+    if index >= length(str) {
+        return str;
+    }
+
+    str_length    := length(str);
+    result        := Allocate<char>(str_length);
+
+    extern::memcpy(result, str, index);
+    extern::memcpy(&result[index], &str[index + 1], str_length - (index + 1));
+
+    result[str_length - 1] = 0;
+    return result;
+}
+
+/// Returns a new string with str2 inserted into str1 at index.
+///
+/// @param str1 the string to insert into
+/// @param str2 the string to insert
+/// @param index the position in str1 to insert at
+fn StringInsert(str1: string, str2: string, index: int) => string {
+    if str1 == "" {
+        return str2;
+    } else if str2 == "" {
+        return str1;
+    }
+
+    str1_length := length(str1);
+    str2_length := length(str2);
+    result      := Allocate<char>(str1_length + str2_length + 1);
+
+    extern::memcpy(result, str1, index);
+    extern::memcpy(&result[index], str2, str2_length);
+    extern::memcpy(&result[index + str2_length], &str1[index], str1_length - index);
+
+    result[str1_length + str2_length] = 0;
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// --- Type casting checks ---
+// ---------------------------------------------------------------------------
+
+/// Returns true if str equals "true" or "false".
+///
+/// @param str the string to check
+fn StringIsBool(str: string) => bool {
+    return str == "true" || str == "false";
+}
+
+/// Returns true if ch is a decimal digit.
+///
+/// @param ch the character to check
+fn IsDigit(ch: char) => bool {
+    return ch >= '0' && ch <= '9';
+}
+
+/// Returns true if ch is an ASCII letter.
+///
+/// @param ch the character to check
+fn IsAlpha(ch: char) => bool {
+    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
+}
+
+/// Returns true if ch is an ASCII letter or digit.
+///
+/// @param ch the character to check
+fn IsAlnum(ch: char) => bool {
+    return IsDigit(ch) || IsAlpha(ch);
+}
+
+/// Returns true if str can be parsed as a float.
+///
+/// @param str the string to check
+fn StringIsFloat(str: string) => bool {
+    if length(str) == 0 {
+        return false;
+    }
+
+    idx: int       = str[0] == '-';
+    str_length    := length(str);
+    found_decimal := false;
+
+    while idx < str_length {
+        if str[idx] == '.' {
+            if found_decimal || idx == str_length - 1 {
+                return false;
+            }
+            found_decimal = true;
+        } else if !IsDigit(str[idx]) {
+            return false;
+        }
+        idx += 1;
+    }
+
+    return true;
+}
+
+/// Returns true if str can be parsed as an integer.
+///
+/// @param str the string to check
+fn StringIsInt(str: string) => int {
+    if length(str) == 0 {
+        return false;
+    }
+
+    idx: int    = str[0] == '-';
+    str_length := length(str);
+
+    while idx < str_length {
+        if !IsDigit(str[idx]) {
+            return false;
+        }
+        idx += 1;
+    }
+
+    return true;
+}
+
+/// Returns true if str has exactly one character.
+///
+/// @param str the string to check
+fn StringIsChar(str: string) => bool {
+    return length(str) == 1;
+}
+
+// ---------------------------------------------------------------------------
+// --- Type casting ---
+// ---------------------------------------------------------------------------
+
+/// Converts str to a bool. Halts the program if str is not "true" or "false".
+///
+/// @param str the string to convert
+fn StringToBool(str: string) => bool {
+    if !StringIsBool(str) {
+        extern::peko_printf("Cannot convert '%s' to a bool\n", str);
+        Exit(134);
+    }
+
+    return str == "true";
+}
+
+/// Converts str to an int. Halts the program if str is not a valid integer.
+///
+/// @param str the string to convert
+///
+/// @example {
+/// n := Runtime::StringToInt("123"); // 123
+/// }
+fn StringToInt(str: string) => int {
+    if !StringIsInt(str) {
+        extern::peko_printf("Cannot convert '%s' to an int\n", str as cstr);
+        Exit(134);
+    }
+
+    int_value  := 0;
+    idx: int    = str[0] == '-';
+    str_length := length(str);
+
+    while idx < str_length {
+        chint      := (str[idx] - 48) as int;
+        int_value  += chint * Exponential(10, (str_length - idx - 1));
+        idx        += 1;
+    }
+
+    if str[0] == '-' {
+        return -int_value;
+    } else {
+        return int_value;
+    }
+}
+
+/// Converts str to a float. Halts the program if str is not a valid number.
+///
+/// @param str the string to convert
+fn StringToFloat(str: string) => float {
+    if !StringIsFloat(str) {
+        if StringIsInt(str) {
+            return StringToInt(str);
+        }
+        extern::peko_printf("Cannot convert '%s' to a float\n", str as cstr);
+        Exit(134);
+    }
+
+    str_length  := length(str);
+    float_value: float = 0.0;
+
+    decimal_idx := 0;
+    while decimal_idx < str_length && str[decimal_idx] != '.' {
+        decimal_idx += 1;
+    }
+
+    idx: int = str[0] == '-';
+    while idx < decimal_idx {
+        chint       := (str[idx] - 48) as int;
+        float_value += chint * Exponential(10, (decimal_idx - idx - 1));
+        idx         += 1;
+    }
+
+    idx += 1;
+    while idx < str_length {
+        chint       := (str[idx] - 48) as float;
+        float_value += chint / Exponential(10, (idx - decimal_idx));
+        idx         += 1;
+    }
+
+    if str[0] == '-' {
+        return -float_value;
+    } else {
+        return float_value;
+    }
+}
+
+/// Converts str to a char. Halts the program if str is not a single character.
+///
+/// @param str the string to convert
+fn StringToChar(str: string) => char {
+    if !StringIsChar(str) {
+        extern::peko_printf("Cannot convert '%s' to a char\n", str as cstr);
+        Exit(134);
+    }
+
+    return str[0];
+}
+
+/// Converts a bool to its string representation.
+///
+/// @param boolean the bool to convert
+fn BoolToString(boolean: bool) => string {
+    if boolean {
+        return "true";
+    } else {
+        return "false";
+    }
+}
+
+[external] fn floorf(f: float) => float;
+[external] fn log10f(f: float) => float;
+
+/// Converts a float to a string with up to 6 significant digits.
+///
+/// @param number the float to convert
+fn FloatToString(number: float) => string {
+    is_negative: int = 0;
+    if number < 0.0 {
+        is_negative = 1;
+        number     *= -1;
+    }
+
+    if number == 0.0 {
+        return "0";
+    }
+
+    exponent: int = extern::floorf(extern::log10f(number));
+    if extern::powf(10, exponent + 1) <= number {
+        exponent += 1;
+    } else if extern::powf(10, exponent) > number {
+        exponent -= 1;
+    }
+
+    SIG_DIGITS  := 6;
+    scale: float = extern::powf(10, SIG_DIGITS - 1 - exponent);
+    sig: int     = number * scale + 0.5;
+
+    if sig >= 1000000 {
+        sig      /= 10;
+        exponent += 1;
+    }
+
+    digits: int = SIG_DIGITS;
+    while digits > 1 && Modulus(sig, 10) == 0 {
+        sig    /= 10;
+        digits -= 1;
+    }
+
+    use_exp := exponent < -4 || exponent >= SIG_DIGITS;
+    buf     := Allocate<char>(16);
+    pos: int = 0;
+
+    if is_negative {
+        buf[pos] = '-';
+        pos += 1;
+    }
+
+    if !use_exp {
+        int_digits: int = exponent + 1;
+
+        if exponent < 0 {
+            buf[pos] = '0';
+            pos += 1;
+            buf[pos] = '.';
+            pos += 1;
+
+            leading: int = -exponent - 1;
+            i := 0;
+            while i < leading {
+                pos += 1;
+                buf[pos] = '0';
+                i += 1;
+            }
+
+            start: int = pos + digits;
+            pos = start - 1;
+            i = 0;
+            while i < digits {
+                buf[pos] = '0' + (Modulus(sig, 10) as int);
+                pos -= 1;
+                sig /= 10;
+                i += 1;
+            }
+            pos = start;
+        } else {
+            tmp := "0000000";
+            t: int = digits - 1;
+            s: int = sig;
+
+            while t >= 0 {
+                tmp[t] = '0' + (Modulus(s, 10) as int);
+                t -= 1;
+                s /= 10;
+            }
+
+            i := 0;
+            while i < int_digits && i < digits {
+                buf[pos] = tmp[i];
+                pos += 1;
+                i += 1;
+            }
+
+            i = digits;
+            while i < int_digits {
+                buf[pos] = '0';
+                pos += 1;
+                i += 1;
+            }
+
+            if digits > int_digits {
+                buf[pos] = '.';
+                pos += 1;
+
+                i = int_digits;
+                while i < digits {
+                    buf[pos] = tmp[i];
+                    pos += 1;
+                    i += 1;
+                }
+            }
+        }
+    } else {
+        tmp := "0000000";
+        t: int = digits - 1;
+        s: int = sig;
+
+        while t >= 0 {
+            tmp[t] = '0' + (Modulus(s, 10) as int);
+            t -= 1;
+            s /= 10;
+        }
+
+        buf[pos] = tmp[0];
+        pos += 1;
+
+        if digits > 1 {
+            buf[pos] = '.';
+            pos += 1;
+
+            i := 0;
+            while i < digits {
+                buf[pos] = tmp[i];
+                pos += 1;
+                i += 1;
+            }
+        }
+
+        buf[pos] = 'e';
+        pos += 1;
+        if exponent >= 0 {
+            buf[pos] = '+';
+        } else {
+            buf[pos] = '-';
+        }
+        pos += 1;
+
+        abs_exp: int = 0;
+        if exponent < 0 {
+            abs_exp = -exponent;
+        } else {
+            abs_exp = exponent;
+        }
+
+        if abs_exp < 10 {
+            buf[pos] = '0';
+            pos += 1;
+            buf[pos] = '0' + abs_exp;
+            pos += 1;
+        } else {
+            buf[pos] = '0' + (abs_exp / 10);
+            pos += 1;
+            buf[pos] = '0' + (abs_exp % 10);
+            pos += 1;
+        }
+    }
+
+    buf[pos] = 0;
+    return buf;
+}
+
+/// Converts an integer to its string representation.
+///
+/// @param number the integer to convert
+///
+/// @example {
+/// text := Runtime::IntToString(42); // "42"
+/// }
+fn IntToString(number: int) => string {
+    if number == 0 {
+        return "0";
+    }
+
+    int_length  := length(number);
+    int_string  := Allocate<char>(int_length + 1);
+
+    if number < 0 {
+        int_string[0] = '-';
+        number       *= -1;
+    }
+
+    idx: int = int_length - 1;
+    while number > 0 {
+        current_digit   := number - (10 * (number / 10));
+        number          /= 10;
+        int_string[idx]  = current_digit + 48;
+        idx             -= 1;
+    }
+
+    int_string[int_length] = 0;
+    return int_string;
+}
+
+/// Converts a char to a single-character string.
+///
+/// @param ch the character to convert
+fn CharToString(ch: char) => string {
+    char_string    := Allocate<char>(2);
+    char_string[0]  = ch;
+    char_string[1]  = 0;
+
+    return char_string;
+}

@@ -1,0 +1,292 @@
+//! Implements native local key-value and secure credential storage for Pekoscript.
+//! Local storage persists JSON values in a per-app SQLite database. Secure
+//! storage holds small secrets such as auth tokens in the platform keychain,
+//! with an encrypted file fallback on systems that have no keychain.
+
+import json@"v0.1.0";
+import crypto@"v0.1.0";
+
+platform android {
+    link libs::android::peko_storage as object;
+    link libs::android::sqlite3 as object;
+    link libs::android::peko_storage_path as object;
+    link libs::android::peko_keychain as object;
+}
+
+platform ios {
+    arch x86_64 {
+        link libs::ios::x86_64::peko_storage as object;
+        link libs::ios::x86_64::sqlite3 as object;
+        link libs::ios::x86_64::peko_storage_path as object;
+        link libs::ios::x86_64::peko_keychain as object;
+    }
+    arch arm {
+        link libs::ios::arm::peko_storage as object;
+        link libs::ios::arm::sqlite3 as object;
+        link libs::ios::arm::peko_storage_path as object;
+        link libs::ios::arm::peko_keychain as object;
+    }
+}
+
+platform windows {
+    link libs::windows::peko_storage as object;
+    link libs::windows::sqlite3 as object;
+    link libs::windows::peko_storage_path as object;
+    link libs::windows::peko_keychain as object;
+}
+
+platform linux {
+    arch x86_64 {
+        link libs::linux::x86_64::peko_storage as object;
+        link libs::linux::x86_64::sqlite3 as object;
+        link libs::linux::x86_64::peko_storage_path as object;
+        link libs::linux::x86_64::peko_keychain as object;
+    }
+    arch arm {
+        link libs::linux::arm::peko_storage as object;
+        link libs::linux::arm::sqlite3 as object;
+        link libs::linux::arm::peko_storage_path as object;
+        link libs::linux::arm::peko_keychain as object;
+    }
+}
+
+platform macos {
+    arch x86_64 {
+        link libs::macos::x86_64::peko_storage as object;
+        link libs::macos::x86_64::sqlite3 as object;
+        link libs::macos::x86_64::peko_storage_path as object;
+        link libs::macos::x86_64::peko_keychain as object;
+    }
+    arch arm {
+        link libs::macos::arm::peko_storage as object;
+        link libs::macos::arm::sqlite3 as object;
+        link libs::macos::arm::peko_storage_path as object;
+        link libs::macos::arm::peko_keychain as object;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- C extern declarations ---
+// ---------------------------------------------------------------------------
+
+// Local SQLite key-value backend. The handle is a malloc'd context holding the
+// database connection and a serialization mutex. It is stable across
+// collections and is stored as opaque. A null handle means the database is
+// not open.
+[external] fn peko_storage_open(app_id: cstr) => opaque;
+[external] fn peko_storage_close(handle: opaque);
+[external] fn peko_storage_set(handle: opaque, key: cstr, json_text: cstr) => int;
+[external] fn peko_storage_get(handle: opaque, key: cstr) => string;
+[external] fn peko_storage_has(handle: opaque, key: cstr) => int;
+[external] fn peko_storage_remove(handle: opaque, key: cstr) => int;
+[external] fn peko_storage_clear(handle: opaque) => int;
+
+// Key listing snapshot. keys_open materializes the current key set into a
+// malloc'd snapshot. keys_count returns the number of keys. keys_at returns
+// one key as a C string owned by the snapshot. keys_free releases it.
+[external] fn peko_storage_keys_open(handle: opaque) => opaque;
+[external] fn peko_storage_keys_count(snapshot: opaque) => int;
+[external] fn peko_storage_keys_at(snapshot: opaque, index: int) => cstr;
+[external] fn peko_storage_keys_free(snapshot: opaque);
+
+// Secure credential backend. set and remove return 1 on success. get returns a
+// GC-managed string, or null when the key is absent.
+[external] fn peko_keychain_set(key: cstr, value: cstr) => int;
+[external] fn peko_keychain_get(key: cstr) => string;
+[external] fn peko_keychain_remove(key: cstr) => int;
+
+// Sets the namespace that isolates secrets per application. The backends use
+// it as the keychain service on Apple, the credential target prefix on
+// Windows, and the app attribute on Linux.
+[external] fn peko_keychain_set_namespace(app_id: cstr);
+
+// ---------------------------------------------------------------------------
+// --- Storage handle ---
+// ---------------------------------------------------------------------------
+
+// The application bundle identifier. The compiler sets this value at code
+// generation. It names the per-app data directory and the per-app keychain
+// namespace on platforms where the identity is not available at runtime. This
+// declaration appears before the storage handle so the value is set before the
+// handle opens.
+application_identifier: cstr = "" as cstr;
+
+// Opens the database, sets the keychain namespace, and registers a cleanup
+// that closes the database when the program exits.
+[hide] fn open_storage() => opaque {
+    extern::peko_keychain_set_namespace(application_identifier);
+    handle := extern::peko_storage_open(application_identifier);
+
+    add_exit_function(closure[handle]() {
+        if handle != null {
+            extern::peko_storage_close(handle);
+        }
+    });
+
+    return handle;
+}
+
+// The open database context. Resolved once when this package is first
+// imported, using the application identifier.
+[private] _storage: opaque = open_storage();
+
+/// Opens the database for a specific application identifier, replacing any
+/// open connection. Most programs do not need this, since the database opens
+/// automatically with the application identifier. Returns true on success.
+///
+/// @param app_id the application identifier used to name the data directory
+fn init(app_id: string) => bool {
+    application_identifier = app_id as cstr;
+    extern::peko_keychain_set_namespace(application_identifier);
+    if _storage != null {
+        extern::peko_storage_close(_storage);
+    }
+    _storage = extern::peko_storage_open(application_identifier);
+    return _storage != null;
+}
+
+/// Returns true if the local database is open and ready.
+fn available() => bool {
+    return _storage != null;
+}
+
+// ---------------------------------------------------------------------------
+// --- Local key-value storage ---
+// ---------------------------------------------------------------------------
+
+/// Stores a JSON value under key. Overwrites any existing value.
+/// Returns true on success, and false when storage is unavailable or the
+/// write fails.
+///
+/// @param key the key to store under
+/// @param value the JSON value to serialize and store
+///
+/// @example {
+/// obj := json::JsonObject();
+/// obj.insert(String("name"), json::JsonString(String("Joe")));
+/// storage::set("user", obj);
+/// }
+fn set(key: string, value: json::JsonValue) => bool {
+    if _storage == null {
+        return false;
+    }
+
+    json_text: string = value.to_string();
+    return extern::peko_storage_set(_storage, key as cstr, json_text as cstr) == 1;
+}
+
+/// Reads the JSON value stored under key.
+/// Returns None when the key is absent, and Error when storage is unavailable
+/// or the stored text does not parse.
+///
+/// @param key the key to read
+///
+/// @example {
+/// user := storage::get("user");
+/// if user.is_value() {
+///     console::println(user?.to_string());
+/// }
+/// }
+fn get(key: string) => json::JsonValue? {
+    if _storage == null {
+        return Error("Storage is not available");
+    }
+
+    raw := extern::peko_storage_get(_storage, key as cstr);
+    if (raw as Pointer<void>) == null {
+        return None;
+    }
+
+    return json::json(String(raw));
+}
+
+/// Returns true if key exists in local storage.
+///
+/// @param key the key to test
+fn has(key: string) => bool {
+    if _storage == null {
+        return false;
+    }
+    return extern::peko_storage_has(_storage, key as cstr) == 1;
+}
+
+/// Removes the value stored under key. Returns true on success.
+/// Removing a key that does not exist is a success.
+///
+/// @param key the key to remove
+fn remove(key: string) => bool {
+    if _storage == null {
+        return false;
+    }
+    return extern::peko_storage_remove(_storage, key as cstr) == 1;
+}
+
+/// Removes every value from local storage. Returns true on success.
+fn clear() => bool {
+    if _storage == null {
+        return false;
+    }
+    return extern::peko_storage_clear(_storage) == 1;
+}
+
+/// Returns all keys currently in local storage, sorted in ascending order.
+/// Returns an empty array when storage is unavailable.
+fn keys() => Array<String> {
+    result := Array<String>();
+    if _storage == null {
+        return result;
+    }
+
+    snapshot := extern::peko_storage_keys_open(_storage);
+    if snapshot == null {
+        return result;
+    }
+
+    count := extern::peko_storage_keys_count(snapshot);
+    for i in range(0, count) {
+        raw := extern::peko_storage_keys_at(snapshot, i);
+        if raw != null {
+            result.push(String(raw as string));
+        }
+    }
+
+    extern::peko_storage_keys_free(snapshot);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// --- Secure credential storage ---
+// ---------------------------------------------------------------------------
+
+/// Stores a secret string under key in the platform keychain.
+/// Intended for small secrets such as auth tokens. Returns true on success.
+///
+/// @param key the credential name
+/// @param value the secret value
+///
+/// @example {
+/// storage::secure_set("auth_token", token);
+/// }
+fn secure_set(key: string, value: string) => bool {
+    return extern::peko_keychain_set(key as cstr, value as cstr) == 1;
+}
+
+/// Reads the secret stored under key.
+/// Returns None when the key is absent.
+///
+/// @param key the credential name
+fn secure_get(key: string) => string? {
+    raw := extern::peko_keychain_get(key as cstr);
+    if (raw as Pointer<void>) == null {
+        return None;
+    }
+    return raw;
+}
+
+/// Removes the secret stored under key. Returns true on success.
+/// Removing a key that does not exist is a success.
+///
+/// @param key the credential name
+fn secure_remove(key: string) => bool {
+    return extern::peko_keychain_remove(key as cstr) == 1;
+}

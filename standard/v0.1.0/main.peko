@@ -1,0 +1,1446 @@
+//! Implements the core standard library for Peko.
+
+import runtime@"v0.1.0" as Runtime;
+
+// ---------------------------------------------------------------------------
+// --- Option ---
+// ---------------------------------------------------------------------------
+
+/// Represents an optional value that can be a value, None, or an Error.
+///
+/// @example {
+/// option: string? = Option<string>("Joe");
+/// }
+class Option<T> {
+    [private] value:   Pointer<T>;
+    [private] error:   string;
+    [private] isnone:  bool;
+    [private] iserror: bool;
+
+    /// Creates a value Option.
+    ///
+    /// @param value the value to wrap
+    constructor(value: T) {
+        this.isnone  = false;
+        this.iserror = false;
+        this.value   = Runtime::Allocate<T>(1);
+        this.value[0] = value;
+        this.error   = "";
+    }
+
+    /// Creates an Error Option.
+    /// The iserror parameter is required when T is string, to avoid
+    /// ambiguity with the value constructor.
+    ///
+    /// @param error the error message
+    /// @param iserror set to true to construct an Error Option
+    constructor(error: string, iserror: bool) {
+        this.isnone  = false;
+        this.iserror = true;
+        this.value   = null;
+        this.error   = error;
+    }
+
+    /// Creates a None Option.
+    constructor() {
+        this.isnone  = true;
+        this.iserror = false;
+        this.value   = null;
+        this.error   = "";
+    }
+
+    /// Unwraps the value. Halts the program if this Option is None or Error.
+    [notrack] fn unwrap() => T {
+        if iserror {
+            Runtime::Exit(Runtime::StringAdd("Runtime Error: ", this.error));
+        }
+
+        if isnone {
+            Runtime::Exit("Attempted to unwrap None value");
+        }
+
+        return value[0];
+    }
+
+    /// Returns the error message. Halts the program if this Option is not an Error.
+    fn get_error() => string {
+        if !iserror {
+            Runtime::Exit("Attempted to get error on non-Error value");
+        }
+
+        return error;
+    }
+
+    /// Returns true if this Option holds a value.
+    fn is_value() => bool {
+        return !isnone && !iserror;
+    }
+
+    /// Returns true if this Option is None.
+    fn is_none() => bool {
+        return isnone;
+    }
+
+    /// Returns true if this Option is an Error.
+    fn is_error() => bool {
+        return iserror;
+    }
+
+    [operator ?]() => T {
+        return this.unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- Iterator ---
+// ---------------------------------------------------------------------------
+
+/// Base iterator class. Intended to be inherited from.
+class Iterator<IT> {
+    /// Creates a base iterator.
+    constructor() {}
+
+    /// Returns the next item and advances the iterator.
+    fn next() => IT {
+        return Default;
+    }
+
+    /// Returns the previous item and decrements the iterator.
+    fn back() => IT {
+        return Default;
+    }
+
+    /// Returns the current item without advancing.
+    fn current() => IT {
+        return Default;
+    }
+
+    /// Returns true if the iterator has more items to yield.
+    fn inrange() => bool {
+        return false;
+    }
+
+    /// Returns this iterator.
+    fn iter() => Iterator<IT> {
+        return this;
+    }
+
+    [operator iterator]() => Iterator<IT> {
+        return this;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- StringIterator ---
+// ---------------------------------------------------------------------------
+
+/// Iterator over the characters of a string.
+[hide] class StringIterator from Iterator<char> {
+    [private] str:   string;
+    [private] index: int;
+
+    constructor(str: string) {
+        this.str   = str;
+        this.index = 0;
+    }
+
+    /// Returns the next character. Halts the program if out of range.
+    [mutates] fn next() => char {
+        if !inrange() {
+            Runtime::Exit("Outside of string iterator range");
+        }
+
+        index += 1;
+        return str[index - 1];
+    }
+
+    /// Returns the previous character. Halts the program if out of range.
+    [mutates] fn back() => char {
+        index -= 1;
+        if !inrange() {
+            Runtime::Exit("Outside of string iterator range");
+        }
+
+        return str[index];
+    }
+
+    /// Returns the current character. Halts the program if out of range.
+    fn current() => char {
+        if !inrange() {
+            Runtime::Exit("Outside of string iterator range");
+        }
+
+        return str[index];
+    }
+
+    /// Returns true if the current index is within the string bounds.
+    fn inrange() => bool {
+        return index >= 0 && index < extern::strlen(str);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- RangeIterator ---
+// ---------------------------------------------------------------------------
+
+/// Iterator over a range of integers.
+[hide] class RangeIterator from Iterator<int> {
+    [private] begin:        int;
+    [private] end:          int;
+    [private] index:        int;
+    [private] increment_by: int;
+
+    /// Creates a new range iterator from begin to end (exclusive).
+    ///
+    /// @param begin the start of the range
+    /// @param end the end of the range (exclusive)
+    constructor(begin: int, end: int) {
+        this.begin = begin;
+        this.end   = end;
+        this.index = begin;
+
+        if end > begin {
+            increment_by = 1;
+        } else {
+            increment_by = -1;
+        }
+    }
+
+    /// Returns the start of this range.
+    fn get_start() => int {
+        return begin;
+    }
+
+    /// Returns the end of this range.
+    fn get_end() => int {
+        return end;
+    }
+
+    /// Returns the next number and advances. Halts the program if out of range.
+    [mutates] fn next() => int {
+        if !inrange() {
+            Runtime::Exit("Outside of range iterator range");
+        }
+
+        return_idx := index;
+        index      += increment_by;
+
+        return return_idx;
+    }
+
+    /// Returns the previous number and decrements. Halts the program if out of range.
+    [mutates] fn back() => int {
+        index -= increment_by;
+        if !inrange() {
+            Runtime::Exit("Outside of range iterator range");
+        }
+
+        return index;
+    }
+
+    /// Returns the current number. Halts the program if out of range.
+    fn current() => int {
+        if !inrange() {
+            Runtime::Exit("Outside of range iterator range");
+        }
+
+        return index;
+    }
+
+    /// Returns true if the current index is within the range.
+    /// Inclusive to begin, exclusive to end.
+    fn inrange() => bool {
+        return (index >= begin && index < end && end > begin) ||
+               (index <= begin && index >= end && end < begin);
+    }
+}
+
+/// Creates a new range iterator from start to end.
+///
+/// @param start the start of the range
+/// @param end the end of the range (exclusive)
+fn range(start: int, end: int) => RangeIterator {
+    return RangeIterator(start, end);
+}
+
+// ---------------------------------------------------------------------------
+// --- ArrayIterator ---
+// ---------------------------------------------------------------------------
+
+/// Iterator over the elements of an Array.
+[hide] class ArrayIterator<IT> from Iterator<IT> {
+    [private] array: Array<IT>;
+    [private] index: int;
+
+    constructor(array: Array<IT>) {
+        this.array = array;
+        this.index = 0;
+    }
+
+    /// Returns the next item and advances. Halts the program if out of bounds.
+    [mutates] fn next() => IT {
+        if !inrange() {
+            Runtime::Exit("Outside of array iterator range");
+        }
+
+        index += 1;
+        return array[index - 1];
+    }
+
+    /// Returns the previous item and decrements. Halts the program if out of bounds.
+    [mutates] fn back() => IT {
+        if !inrange() {
+            Runtime::Exit("Outside of array iterator range");
+        }
+
+        index -= 1;
+        return array[index + 1];
+    }
+
+    /// Returns the current item. Halts the program if out of bounds.
+    fn current() => IT {
+        if !inrange() {
+            Runtime::Exit("Outside of array iterator range");
+        }
+
+        return array[index];
+    }
+
+    /// Returns true if the index is within the array bounds.
+    fn inrange() => bool {
+        return index >= 0 && index < array.length();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- Array ---
+// ---------------------------------------------------------------------------
+
+/// A dynamic heap-allocated list of items of type T.
+class Array<T> {
+    [private] values: Pointer<T>;
+    [private] size:   int;
+
+    /// Creates a new empty Array.
+    constructor() {
+        this.values = null;
+        this.size   = 0;
+    }
+
+    /// Returns the number of items in this Array.
+    fn length() => int {
+        return size;
+    }
+
+    /// Returns the last item of this Array.
+    /// Returns Error if the Array is empty.
+    fn back() => T? {
+        if this.size == 0 {
+            return Error("No items in this array");
+        }
+
+        return values[size - 1];
+    }
+
+    /// Removes and returns the item at index.
+    /// Returns Error if the index is out of bounds.
+    ///
+    /// @param index the index to remove
+    [mutates] fn remove(index: int) => T? {
+        if index < 0 || index >= size {
+            return Error("Cannot remove item outside array bounds");
+        }
+
+        remove_value  := values[index];
+        values: Pointer<T> = Runtime::Allocate<T>(size - 1);
+
+        i := 0;
+        while i < size {
+            if i > index {
+                values[i - 1] = this.values[i];
+            } else if i < index {
+                values[i] = this.values[i];
+            }
+            i += 1;
+        }
+
+        this.values = values;
+        size -= 1;
+        return remove_value;
+    }
+
+    /// Removes and returns the last item of this Array.
+    /// Returns Error if the Array is empty.
+    [mutates] fn pop() => T? {
+        return remove(size - 1);
+    }
+
+    /// Removes all items from this Array.
+    [mutates] fn clear() {
+        while this.size > 0 {
+            this.pop();
+        }
+    }
+
+    /// Inserts value at index.
+    /// Halts the program if the index is out of bounds.
+    ///
+    /// @param value the item to insert
+    /// @param index the index to insert at
+    [mutates] fn insert(value: T, index: int) {
+        if index > size {
+            Runtime::Exit("Attempted to insert item at index outside of array bounds");
+        }
+
+        new_values: Pointer<T> = Runtime::Allocate<T>(size + 1);
+
+        for i in range(0, size) {
+            new_values[i] = this.values[i];
+        }
+
+        i := size;
+        while i >= index && i >= 1 {
+            new_values[i] = new_values[i - 1];
+            i -= 1;
+        }
+
+        new_values[index] = value;
+
+        this.values = new_values;
+        size += 1;
+    }
+
+    /// Appends value to the end of this Array.
+    ///
+    /// @param value the item to append
+    [mutates] fn push(value: T) {
+        insert(value, size);
+    }
+
+    /// Appends all items from other to the end of this Array.
+    ///
+    /// @param other the collection whose items are appended
+    [mutates] fn extend(other: Array<T>) {
+        for item in other {
+            push(item);
+        }
+    }
+
+    [mutates] [operator +](rhs: Array<T>) => Array<T> {
+        copy := Array<T>();
+        copy.extend(this);
+        copy.extend(rhs);
+        return copy;
+    }
+
+    [mutates] [operator +](rhs: T) => Array<T> {
+        copy := Array<T>();
+        copy.extend(this);
+        copy.push(rhs);
+        return copy;
+    }
+
+    [operator []](index: int) => T {
+        if index < 0 || index >= size {
+            Runtime::Exit(Runtime::StringAdd("No item at index ", index));
+        }
+
+        return values[index];
+    }
+
+    [mutates] [operator []=](index: int) => &T {
+        if index < 0 || index >= size {
+            Runtime::Exit(Runtime::StringAdd("No item at index ", index));
+        }
+
+        return &values[index];
+    }
+
+    [operator iterator]() => Iterator<T> {
+        return ArrayIterator<T>(this);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- List ---
+// ---------------------------------------------------------------------------
+
+/// Extends Array with search operations.
+/// Requires that T implements the == operator.
+class List<T> from Array<T> {
+
+    /// Returns the index of the first occurrence of value.
+    /// Returns -1 if not found.
+    ///
+    /// @param value the item to search for
+    fn find(value: T) => int {
+        i := 0;
+
+        while i < size {
+            if values[i] == value {
+                return i;
+            }
+            i += 1;
+        }
+
+        return -1;
+    }
+
+    /// Returns true if this List contains value.
+    ///
+    /// @param value the item to search for
+    fn contains(value: T) => bool {
+        return find(value) > -1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- String ---
+// ---------------------------------------------------------------------------
+
+/// Wrapper class for the string type. Supports dynamic string operations.
+class String {
+    [private] value: string;
+
+    /// Creates a new String with the provided value.
+    ///
+    /// @param value the initial string value
+    constructor(value: string) {
+        this.value = value;
+    }
+
+    /// Creates an empty String.
+    constructor() {
+        this.value = "";
+    }
+
+    /// Returns a copy of this string with all occurrences of ch escaped with a backslash.
+    ///
+    /// @example {
+    /// s := String("ab\"cd");
+    /// console::println(s.cancel('"')); // prints 'ab\"cd'
+    /// }
+    ///
+    /// @param ch the character to escape
+    fn cancel(ch: char) => String {
+        new_string := String();
+
+        for c in this {
+            if c == ch {
+                new_string.push('\\');
+            }
+            new_string.push(c);
+        }
+
+        return new_string;
+    }
+
+    /// Returns the length of this String.
+    fn length() => int {
+        return Runtime::length(value);
+    }
+
+    /// Returns the last character of this String.
+    /// Returns Error if the String is empty.
+    fn back() => char? {
+        if length() == 0 {
+            return Error("String has no characters");
+        }
+
+        return value[length() - 1];
+    }
+
+    /// Removes and returns the character at index.
+    /// Returns Error if the index is out of bounds.
+    ///
+    /// @param index the index to remove
+    [mutates] fn remove(index: int) => char? {
+        if index < 0 || index >= length() {
+            return Error("Cannot remove item at index outside of string bounds");
+        }
+
+        ch    := value[index];
+        value  = Runtime::StringRemove(value, index);
+
+        return ch;
+    }
+
+    /// Removes and returns the last character.
+    /// Returns Error if the String is empty.
+    [mutates] fn pop() => char? {
+        return this.remove(length() - 1);
+    }
+
+    /// Inserts character c at index.
+    /// Halts the program if the index is out of bounds.
+    ///
+    /// @param c the character to insert
+    /// @param index the index to insert at
+    [mutates] fn insert(c: char, index: int) {
+        if index < 0 || index > length() {
+            Runtime::Exit("Attempted to insert character at index outside of string bounds");
+        }
+
+        value = Runtime::StringInsert(value, c, index);
+    }
+
+    /// Appends str to this String.
+    ///
+    /// @param str the string to append
+    [mutates] fn push(str: string) {
+        value = Runtime::StringAdd(value, str);
+    }
+
+    /// Appends ch to this String.
+    ///
+    /// @param ch the character to append
+    [mutates] fn push(ch: char) {
+        value = Runtime::StringAdd(value, ch as string);
+    }
+
+    [operator to_string]() => string {
+        return value;
+    }
+
+    [operator to_int]() => int {
+        return Runtime::StringToInt(value);
+    }
+
+    [operator to_float]() => float {
+        return Runtime::StringToFloat(value);
+    }
+
+    [operator to_char]() => char {
+        return Runtime::StringToChar(value);
+    }
+
+    [operator to_double]() => double {
+        return Runtime::StringToFloat(value) as double;
+    }
+
+    [operator to_bool]() => bool {
+        return Runtime::StringToBool(value);
+    }
+
+    [mutates] [operator +](rhs: string) => string {
+        return Runtime::StringAdd(value, rhs);
+    }
+
+    [mutates] [operator *](rhs: int) => string {
+        str := String();
+
+        for i in range(0, rhs) {
+            str.push(value);
+        }
+
+        return str;
+    }
+
+    [mutates] [operator []=](index: int) => &char {
+        if index < 0 || index >= length() {
+            Runtime::Exit(Runtime::StringAdd("No character at index ", index));
+        }
+
+        return &value[index];
+    }
+
+    [operator []](index: int) => char {
+        if index < 0 || index >= length() {
+            Runtime::Exit(Runtime::StringAdd("No character at index ", index));
+        }
+
+        return value[index];
+    }
+
+    [operator []](r: RangeIterator) => String? {
+        return substring(r.get_start(), r.get_end());
+    }
+
+    [operator ==](other: string) => bool {
+        return extern::strcmp(this.value as cstr, other as cstr) == 0;
+    }
+
+    [operator !=](other: String) => bool {
+        return extern::strcmp(this.value as cstr, other as string) != 0;
+    }
+
+    /// Returns the substring from start to end (exclusive).
+    /// Returns a reversed substring if end < start.
+    /// Returns Error if start or end are out of bounds.
+    ///
+    /// @param start the start index
+    /// @param end the end index (exclusive)
+    fn substring(start: int, end: int) => String? {
+        if start == end {
+            return String("");
+        }
+
+        if start < 0 || start >= length() || end < 0 || end > length() {
+            return Error("Cannot get substring at indexes outside of string bounds");
+        }
+
+        result := String("");
+
+        for i in range(start, end) {
+            result.push(value[i]);
+        }
+
+        return result;
+    }
+
+    /// Returns the substring from start to the end of the string.
+    /// Returns Error if start is out of bounds.
+    ///
+    /// @param start the start index
+    fn substring(start: int) => String? {
+        return this.substring(start, this.length());
+    }
+
+    /// Returns the index of the first occurrence of ch.
+    /// Returns -1 if ch is not found.
+    ///
+    /// @param ch the character to search for
+    fn find(ch: char) => int {
+        for i in range(0, length()) {
+            if value[i] == ch {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    /// Returns the index of the first occurrence of needle at or after start.
+    /// Returns -1 if needle is not found. An empty needle matches at start.
+    ///
+    /// @param needle the substring to search for
+    /// @param start the index to begin searching from
+    [private] fn find_from(needle: string, start: int) => int {
+        needle_length := Runtime::length(needle);
+
+        if needle_length == 0 {
+            return start;
+        }
+
+        if needle_length > length() {
+            return -1;
+        }
+
+        last := length() - needle_length;
+        i    := start;
+        if i < 0 {
+            i = 0;
+        }
+
+        while i <= last {
+            matched := true;
+            j       := 0;
+            while j < needle_length {
+                if value[i + j] != needle[j] {
+                    matched = false;
+                    break;
+                }
+                j += 1;
+            }
+            if matched {
+                return i;
+            }
+            i += 1;
+        }
+
+        return -1;
+    }
+
+    /// Returns the index of the first occurrence of needle.
+    /// Returns -1 if needle is not found. An empty needle matches at index 0.
+    ///
+    /// @example {
+    /// s := String("hello world");
+    /// console::println(s.find("world")); // prints '6'
+    /// }
+    ///
+    /// @param needle the substring to search for
+    fn find(needle: string) => int {
+        return this.find_from(needle, 0);
+    }
+
+    /// Splits this String at the first occurrence of delimiter.
+    /// Returns an Array with one item if the delimiter is not found.
+    ///
+    /// @param delimiter the delimiter to split on
+    fn lsplit(delimiter: char) => Array<String> {
+        result           := Array<String>();
+        current          := String();
+        split_done       := false;
+
+        for ch in this {
+            if ch == delimiter && !split_done {
+                result.push(current);
+                current    = String();
+                split_done = true;
+            } else {
+                current.push(ch);
+            }
+        }
+
+        if current != "" {
+            result.push(current);
+        }
+
+        return result;
+    }
+
+    /// Splits this String at the first occurrence of a multi-character
+    /// delimiter. Returns an Array with one item if the delimiter is not found.
+    /// A trailing empty segment is dropped. An empty delimiter returns the
+    /// whole String as a single item.
+    ///
+    /// @example {
+    /// s := String("key=val=extra");
+    /// parts := s.lsplit("=");
+    /// console::println(parts[0]); // prints 'key'
+    /// console::println(parts[1]); // prints 'val=extra'
+    /// }
+    ///
+    /// @param delimiter the delimiter to split on
+    fn lsplit(delimiter: string) => Array<String> {
+        result            := Array<String>();
+        delimiter_length  := Runtime::length(delimiter);
+
+        if delimiter_length == 0 {
+            result.push(String(this.value));
+            return result;
+        }
+
+        index := this.find_from(delimiter, 0);
+        if index == -1 {
+            result.push(String(this.value));
+            return result;
+        }
+
+        head := this.substring(0, index);
+        if head.is_value() {
+            result.push(head?);
+        }
+
+        tail := this.substring(index + delimiter_length);
+        if tail.is_value() && tail? != "" {
+            result.push(tail?);
+        }
+
+        return result;
+    }
+
+    /// Splits this String at every occurrence of delimiter.
+    /// Returns an Array with one item if the delimiter is not found.
+    ///
+    /// @param delimiter the delimiter to split on
+    fn split(delimiter: char) => Array<String> {
+        result  := Array<String>();
+        current := String();
+
+        for ch in this {
+            if ch == delimiter {
+                result.push(current);
+                current = String();
+            } else {
+                current.push(ch);
+            }
+        }
+
+        if current != "" {
+            result.push(current);
+        }
+
+        return result;
+    }
+
+    /// Splits this String at every occurrence of a multi-character delimiter.
+    /// Returns an Array with one item if the delimiter is not found. A trailing
+    /// empty segment is dropped. An empty delimiter returns the whole String as
+    /// a single item.
+    ///
+    /// @example {
+    /// s := String("a::b::c");
+    /// parts := s.split("::");
+    /// console::println(parts.length()); // prints '3'
+    /// }
+    ///
+    /// @param delimiter the delimiter to split on
+    fn split(delimiter: string) => Array<String> {
+        result            := Array<String>();
+        delimiter_length  := Runtime::length(delimiter);
+
+        if delimiter_length == 0 {
+            result.push(String(this.value));
+            return result;
+        }
+
+        segment_start := 0;
+        while true {
+            index := this.find_from(delimiter, segment_start);
+            if index == -1 {
+                break;
+            }
+
+            segment := this.substring(segment_start, index);
+            if segment.is_value() {
+                result.push(segment?);
+            } else {
+                result.push(String(""));
+            }
+
+            segment_start = index + delimiter_length;
+        }
+
+        tail := this.substring(segment_start);
+        if tail.is_value() && tail? != "" {
+            result.push(tail?);
+        }
+
+        return result;
+    }
+
+    /// Returns true if this String contains ch.
+    ///
+    /// @param ch the character to search for
+    fn contains(ch: char) => bool {
+        return this.find(ch) != -1;
+    }
+
+    /// Returns true if this String contains needle.
+    /// Returns true when needle is empty.
+    ///
+    /// @example {
+    /// s := String("hello world");
+    /// console::println(s.contains("o w")); // prints 'true'
+    /// }
+    ///
+    /// @param needle the substring to search for
+    fn contains(needle: string) => bool {
+        return this.find_from(needle, 0) != -1;
+    }
+
+    /// Returns a copy of this String with leading and trailing whitespace removed.
+    /// Whitespace is spaces, tabs, newlines, and carriage returns.
+    ///
+    /// @example {
+    /// s := String("  hello  ");
+    /// console::println(s.trim()); // prints 'hello'
+    /// }
+    fn trim() => String {
+        len := length();
+
+        start := 0;
+        while start < len {
+            ch := value[start];
+            if ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r' {
+                break;
+            }
+            start += 1;
+        }
+
+        end := len;
+        while end > start {
+            ch := value[end - 1];
+            if ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r' {
+                break;
+            }
+            end -= 1;
+        }
+
+        if start >= end {
+            return String("");
+        }
+
+        return substring(start, end)?;
+    }
+
+    /// Returns true if this String begins with prefix.
+    /// Returns true when prefix is empty.
+    ///
+    /// @param prefix the prefix to test for
+    ///
+    /// @example {
+    /// s := String("hello world");
+    /// console::println(s.starts_with("hello")); // prints 'true'
+    /// }
+    fn starts_with(prefix: string) => bool {
+        prefix_length := Runtime::length(prefix);
+
+        if prefix_length > length() {
+            return false;
+        }
+
+        for i in range(0, prefix_length) {
+            if value[i] != prefix[i] {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// Returns true if this String ends with suffix.
+    /// Returns true when suffix is empty.
+    ///
+    /// @param suffix the suffix to test for
+    ///
+    /// @example {
+    /// s := String("hello world");
+    /// console::println(s.ends_with("world")); // prints 'true'
+    /// }
+    fn ends_with(suffix: string) => bool {
+        suffix_length := Runtime::length(suffix);
+        offset        := length() - suffix_length;
+
+        if offset < 0 {
+            return false;
+        }
+
+        for i in range(0, suffix_length) {
+            if value[offset + i] != suffix[i] {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    [operator iterator]() => Iterator<char> {
+        return StringIterator(value);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- Pair ---
+// ---------------------------------------------------------------------------
+
+/// Holds two values of types FT and ST.
+class Pair<FT, ST> {
+    [private] first:  FT;
+    [private] second: ST;
+
+    /// Creates a new Pair.
+    ///
+    /// @param first the first item
+    /// @param second the second item
+    constructor(first: FT, second: ST) {
+        this.first  = first;
+        this.second = second;
+    }
+
+    /// Returns the first item.
+    fn get_first() => FT {
+        return first;
+    }
+
+    /// Returns the second item.
+    fn get_second() => ST {
+        return second;
+    }
+
+    /// Returns a reference to the first item.
+    [mutates] fn first_reference() => &FT {
+        return &first;
+    }
+
+    /// Returns a reference to the second item.
+    [mutates] fn second_reference() => &ST {
+        return &second;
+    }
+
+    /// Sets the first item.
+    ///
+    /// @param first the new first item
+    [mutates] fn set_first(first: FT) {
+        this.first = first;
+    }
+
+    /// Sets the second item.
+    ///
+    /// @param second the new second item
+    [mutates] fn set_second(second: ST) {
+        this.second = second;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- MapIterator ---
+// ---------------------------------------------------------------------------
+
+/// Iterator over the key-value pairs of a Map.
+[hide] class MapIterator<KT, VT> from Iterator<Pair<KT, VT>> {
+    [private] map:   Map<KT, VT>;
+    [private] index: int;
+
+    constructor(map: Map<KT, VT>) {
+        this.map   = map;
+        this.index = 0;
+    }
+
+    /// Returns the next pair and advances. Halts the program if out of bounds.
+    [mutates] fn next() => Pair<KT, VT> {
+        if !inrange() {
+            Runtime::Exit("Outside of map iterator range");
+        }
+
+        index += 1;
+        return map.get_pair(index - 1)?;
+    }
+
+    /// Returns the previous pair and decrements. Halts the program if out of bounds.
+    [mutates] fn back() => Pair<KT, VT> {
+        if !inrange() {
+            Runtime::Exit("Outside of map iterator range");
+        }
+
+        index -= 1;
+        return map.get_pair(index + 1)?;
+    }
+
+    /// Returns the current pair. Halts the program if out of bounds.
+    fn current() => Pair<KT, VT> {
+        if !inrange() {
+            Runtime::Exit("Outside of map iterator range");
+        }
+
+        return map.get_pair(index)?;
+    }
+
+    /// Returns true if the index is within the Map bounds.
+    fn inrange() => bool {
+        return index >= 0 && index < map.length();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- Map ---
+// ---------------------------------------------------------------------------
+
+/// A map of keys of type KT to values of type VT.
+/// Uses a linear scan index map, not a hashmap.
+class Map<KT, VT> {
+    [private] key_value_pairs: Array<Pair<KT, VT>>;
+
+    /// Creates a new empty Map.
+    constructor() {
+        key_value_pairs = Array<Pair<KT, VT>>();
+    }
+
+    /// Returns the number of key-value pairs in this Map.
+    fn length() => int {
+        return key_value_pairs.length();
+    }
+
+    /// Removes the key-value pair with the given key and returns the value.
+    /// Returns Error if the key does not exist.
+    ///
+    /// @param key the key to remove
+    [mutates] fn remove(key: KT) => VT? {
+        if !contains(key) {
+            return Error("No such key");
+        }
+
+        removed_value := get(key);
+
+        i := 0;
+        while i < key_value_pairs.length() {
+            if key_value_pairs[i].get_first() == key {
+                key_value_pairs.remove(i);
+                break;
+            }
+            i += 1;
+        }
+
+        return removed_value;
+    }
+
+    /// Inserts a key-value pair into this Map.
+    /// If the key already exists, updates its value.
+    ///
+    /// @param key the key to insert
+    /// @param value the item to insert
+    [mutates] fn insert(key: KT, value: VT) {
+        if contains(key) {
+            i := 0;
+            while i < key_value_pairs.length() {
+                if key_value_pairs[i].get_first() == key {
+                    key_value_pairs[i].set_second(value);
+                    return;
+                }
+                i += 1;
+            }
+        }
+
+        key_value_pairs.push(Pair<KT, VT>(key, value));
+    }
+
+    /// Returns true if key exists in this Map.
+    ///
+    /// @param key the key to look up
+    fn contains(key: KT) => bool {
+        for pair in key_value_pairs {
+            if pair.get_first() == key {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// Returns the value for the given key.
+    /// Returns Error if the key does not exist.
+    ///
+    /// @param key the key to look up
+    fn get(key: KT) => VT? {
+        for pair in key_value_pairs {
+            if pair.get_first() == key {
+                return pair.get_second();
+            }
+        }
+
+        return Error("No such key");
+    }
+
+    /// Returns the key-value pair at the given index.
+    /// Returns Error if the index is out of bounds.
+    ///
+    /// @param index the index of the pair
+    fn get_pair(index: int) => Pair<KT, VT>? {
+        if index < 0 || index >= length() {
+            return Error(Runtime::StringAdd("Pair does not exist at index ", index));
+        }
+
+        return key_value_pairs[index];
+    }
+
+    /// Extends this Map with all key-value pairs from other.
+    ///
+    /// @param other the collection whose items are appended
+    [mutates] fn extend(other: Map<KT, VT>) {
+        for key_value in other {
+            this.insert(key_value.get_first(), key_value.get_second());
+        }
+    }
+
+    [operator []](index: KT) => VT {
+        return get(index)?;
+    }
+
+    [mutates] [operator []=](index: KT) => &VT {
+        for pair in key_value_pairs {
+            if pair.get_first() == index {
+                return pair.second_reference();
+            }
+        }
+
+        Runtime::Exit("No such key");
+        return Default;
+    }
+
+    [operator iterator]() => Iterator<Pair<KT, VT>> {
+        return MapIterator<KT, VT>(this);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- Box ---
+// ---------------------------------------------------------------------------
+
+/// A mutable reference cell holding a single value.
+///
+/// A Box is a reference type. Every holder of the same Box shares one
+/// cell, so a write through any holder is visible to all of them. This
+/// turns a value type into shared mutable state: store a Box in a Mutex,
+/// lock to obtain the live Box, and mutate it in place.
+///
+/// @example {
+/// shared := threads::Mutex<Box<int>>(Box<int>(0));
+/// threads::new_thread(closure[shared]() {
+///     box := shared.lock();
+///     box.set(box.get() + 1);
+///     shared.release();
+/// });
+/// }
+class Box<T> {
+    // The value is a direct field. As a field of a managed class it is
+    // traced by the class descriptor. A reference-type T is relocated by
+    // the collector on a move. A value-type T is stored inline. The Box
+    // is a reference type, so holders of the same Box share one cell.
+    [private] value: T;
+
+    /// Creates a Box holding the provided value.
+    ///
+    /// @param value the initial value
+    constructor(value: T) {
+        this.value = value;
+    }
+
+    /// Returns the boxed value. A reference-type value is the live shared
+    /// reference. A value-type value is a copy.
+    ///
+    /// @return the boxed value
+    fn get() => T {
+        return this.value;
+    }
+
+    /// Replaces the boxed value.
+    ///
+    /// @param value the new value
+    [mutates] fn set(value: T) {
+        this.value = value;
+    }
+
+    /// Applies a function to the boxed value and stores the result.
+    ///
+    /// @param f maps the current value to the next value
+    [mutates] fn update(f: closure(T) => T) {
+        this.value = f(this.value);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --- format ---
+// ---------------------------------------------------------------------------
+
+/// Interpolates items from formats into format_string at each % character.
+/// Use %~ to insert a literal % character.
+/// Returns Error if there are not enough items in formats.
+///
+/// @example {
+/// format("Hello %.", #["Joe"])?;           // returns "Hello Joe."
+/// format("We are %%~ done!", #["80"])?;   // returns "We are 80% done!"
+/// format("Hello % I am %", #["world"]);   // returns Error
+/// }
+///
+/// @param format_string the format string with % placeholders
+/// @param formats the items to interpolate at each %
+fn format(format_string: string, formats: Array<string>) => String? {
+    final_string := String();
+    format_index := 0;
+    i            := 0;
+
+    while i < Runtime::length(format_string) {
+        ch := format_string[i];
+
+        if ch == '%' {
+            if (i + 1 < Runtime::length(format_string)) && (format_string[i + 1] == '~') {
+                final_string.push('%');
+                i += 1;
+            } else {
+                if format_index >= formats.length() {
+                    return Error("Not enough formats provided");
+                }
+
+                final_string.push(formats[format_index]);
+                format_index += 1;
+            }
+        } else {
+            final_string.push(ch);
+        }
+
+        i += 1;
+    }
+
+    return Option<String>(final_string);
+}
+
+/// Used internally by the compiler to interpolate values.
+[hide] fn unsafe_format(format_string: string, formats: Array<string>) => String {
+    return format(format_string, formats)?;
+}
+
+// ---------------------------------------------------------------------------
+// --- Program lifecycle ---
+// ---------------------------------------------------------------------------
+
+[private] exit_functions: Array<closure()> = Array<closure()>();
+
+/// Registers a function to be called when the program exits.
+[hide] fn add_exit_function(exit_function: closure()) {
+    exit_functions.push(exit_function);
+}
+
+/// Holds all command line arguments passed to this program.
+[hide] system_args: Array<String> = Array<String>();
+
+/// Entry point. Override this in user code.
+[external] fn OnStart();
+
+/// Used by the compiler to initialize global variable values.
+[external] fn __create_globals();
+[external notrack] fn pgc_init(heap_bytes: int) => int;
+[external notrack] fn pgc_shutdown();
+[external notrack] fn pgc_thread_attach();
+[external notrack] fn pgc_thread_detach();
+
+/// Exits the program cleanly, running all registered exit functions.
+fn EndProgram() {
+    for exit_function in exit_functions {
+        exit_function();
+    }
+
+    Runtime::Exit(0);
+}
+
+// ---------------------------------------------------------------------------
+// --- Platform entry points ---
+// ---------------------------------------------------------------------------
+
+platform android {
+    [external] fn peko_storage_android_init();
+
+    [hide] fn pekomain() {
+        extern::pgc_init(0);
+        extern::pgc_thread_attach();
+        extern::peko_storage_android_init();
+        extern::__create_globals();
+        extern::OnStart();
+
+        for exit_function in exit_functions {
+            exit_function();
+        }
+
+        extern::pgc_thread_detach();
+        extern::pgc_shutdown();
+    }
+
+    [external] fn main(argc: int, argv: cstr[]) => int {
+        pekomain();
+        return 0;
+    }
+}
+
+platform windows {
+    [external] fn windowsStart();
+    [external] fn windowsCleanup();
+}
+
+platform windows|linux|macos|ios {
+    [external] fn main(argc: int, argv: cstr[]) => int {
+        platform windowsgui {
+            Runtime::HideWindowsConsole();
+        }
+
+        extern::pgc_init(0);
+        extern::pgc_thread_attach();
+        extern::__create_globals();
+
+        for i in range(0, argc) {
+            system_args.push(String(argv[i] as string));
+        }
+
+        platform windows { extern::windowsStart(); }
+        extern::OnStart();
+        platform windows { extern::windowsCleanup(); }
+
+        for exit_function in exit_functions {
+            exit_function();
+        }
+
+        extern::pgc_thread_detach();
+        extern::pgc_shutdown();
+        return 0;
+    }
+}

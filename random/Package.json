@@ -1,0 +1,9 @@
+{
+  "name": "random",
+  "label": "Standard Random Package",
+  "description": "Implements a basic random number generator.",
+  "latest": "v0.1.0",
+  "versions": [
+    "v0.1.0"
+  ]
+}

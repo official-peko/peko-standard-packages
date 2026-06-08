@@ -1,0 +1,209 @@
+//! Implements fast non-cryptographic random number generation for Pekoscript.
+//!
+//! This package uses the CMWC (Complementary Multiply With Carry) algorithm.
+//! It is NOT cryptographically secure. For security-sensitive random data,
+//! use the crypto package instead (crypto::random_bytes, crypto::random_u32).
+
+platform windows {
+    link libs::windows::peko_random as object;
+}
+
+platform macos {
+    arch arm {
+        link libs::macos::arm::peko_random as object;
+    }
+    arch x86_64 {
+        link libs::macos::x86_64::peko_random as object;
+    }
+}
+
+platform linux {
+    arch arm {
+        link libs::linux::arm::peko_random as object;
+    }
+    arch x86_64 {
+        link libs::linux::x86_64::peko_random as object;
+    }
+}
+
+platform ios {
+    arch arm {
+        link libs::ios::arm::peko_random as object;
+    }
+    arch x86_64 {
+        link libs::ios::x86_64::peko_random as object;
+    }
+}
+
+platform android {
+    link libs::android::peko_random as object;
+}
+
+// ---------------------------------------------------------------------------
+// --- C extern declarations ---
+// ---------------------------------------------------------------------------
+
+[external] fn peko_random_init();
+[external] fn peko_random_seed(seed: int);
+[external] fn peko_random_int(min: int, max: int) => int;
+[external] fn peko_random_float() => float;
+[external] fn peko_random_bool() => bool;
+
+[external] fn peko_rng_new() => opaque?;
+[external] fn peko_rng_new_seeded(seed: int) => opaque?;
+[external] fn peko_rng_free(rng: opaque);
+[external] fn peko_rng_seed(rng: opaque, seed: int);
+[external] fn peko_rng_int(rng: opaque, min: int, max: int) => int;
+[external] fn peko_rng_float(rng: opaque) => float;
+[external] fn peko_rng_bool(rng: opaque) => bool;
+
+// ---------------------------------------------------------------------------
+// --- Global RNG ---
+// Uses a single shared CMWC state seeded from the current time on first use.
+// Thread-safe via C11 atomics. Not suitable for cryptographic use.
+// ---------------------------------------------------------------------------
+
+/// Seeds the global RNG with a specific value.
+/// Use this for reproducible sequences such as in tests or simulations.
+/// If not called, the RNG seeds itself from the current time on first use.
+///
+/// @param s the seed value
+fn seed(s: int) {
+    extern::peko_random_seed(s);
+}
+
+/// Returns a random int in the range [min, max).
+/// max is exclusive. If max <= min, returns min.
+///
+/// @param min the inclusive lower bound
+/// @param max the exclusive upper bound
+///
+/// @example {
+/// dice := random::int(1, 7); // returns 1, 2, 3, 4, 5, or 6
+/// }
+fn int(min: int, max: int) => int {
+    return extern::peko_random_int(min, max);
+}
+
+/// Returns a random float in the range [0.0, 1.0).
+///
+/// @example {
+/// chance := random::float();
+/// if chance < 0.25 {
+///     console::println("25 percent chance triggered");
+/// }
+/// }
+fn float() => float {
+    return extern::peko_random_float();
+}
+
+/// Returns a random bool.
+///
+/// @example {
+/// if random::bool() {
+///     console::println("heads");
+/// } else {
+///     console::println("tails");
+/// }
+/// }
+fn bool() => bool {
+    return extern::peko_random_bool();
+}
+
+/// Returns a random element from the provided array.
+/// Returns None if the array is empty.
+///
+/// @param array the array to pick from
+///
+/// @example {
+/// names := #["Alice", "Bob", "Carol"];
+/// picked := random::choice(names)?;
+/// console::println(picked);
+/// }
+fn choice<T>(array: Array<T>) => T? {
+    if array.length() == 0 {
+        return None;
+    }
+    idx := extern::peko_random_int(0, array.length());
+    return array[idx];
+}
+
+// ---------------------------------------------------------------------------
+// --- Rng class ---
+// An independent RNG instance with its own state.
+// Use this when you need reproducible or isolated random sequences.
+// ---------------------------------------------------------------------------
+
+/// An independent non-cryptographic random number generator.
+/// Each Rng instance has its own state separate from the global RNG,
+/// so seeding one does not affect the other.
+///
+/// @example {
+/// rng := random::Rng(42); // reproducible sequence seeded with 42
+/// console::println(rng.int(1, 100));
+/// console::println(rng.float());
+/// }
+class Rng {
+    [private] handle: opaque;
+
+    /// Creates a new Rng seeded from the current time.
+    constructor() {
+        this.handle = extern::peko_rng_new()?;
+    }
+
+    /// Creates a new Rng with the provided seed.
+    /// Using the same seed always produces the same sequence.
+    ///
+    /// @param seed the seed value
+    constructor(seed: int) {
+        this.handle = extern::peko_rng_new_seeded(seed)?;
+    }
+
+    /// Re-seeds this Rng with the provided value.
+    /// Resets the sequence to be reproducible from this seed.
+    ///
+    /// @param s the seed value
+    [mutates] fn seed(s: int) {
+        extern::peko_rng_seed(this.handle, s);
+    }
+
+    /// Returns a random int in the range [min, max).
+    /// max is exclusive. If max <= min, returns min.
+    ///
+    /// @param min the inclusive lower bound
+    /// @param max the exclusive upper bound
+    fn int(min: int, max: int) => int {
+        return extern::peko_rng_int(this.handle, min, max);
+    }
+
+    /// Returns a random float in the range [0.0, 1.0).
+    fn float() => float {
+        return extern::peko_rng_float(this.handle);
+    }
+
+    /// Returns a random bool.
+    fn bool() => bool {
+        return extern::peko_rng_bool(this.handle);
+    }
+
+    /// Returns a random element from the provided array.
+    /// Returns None if the array is empty.
+    ///
+    /// @param array the array to pick from
+    fn choice<T>(array: Array<T>) => T? {
+        if array.length() == 0 {
+            return None;
+        }
+        idx := extern::peko_rng_int(this.handle, 0, array.length());
+        return array[idx];
+    }
+
+    /// Frees the underlying C heap memory for this Rng instance.
+    /// Call this when you are done with the Rng to avoid a memory leak.
+    /// The GC manages the Rng object itself but cannot free the underlying
+    /// malloc'd C state - you must call free() explicitly before discarding.
+    /// The Rng must not be used after this call.
+    fn free() {
+        extern::peko_rng_free(this.handle);
+    }
+}
