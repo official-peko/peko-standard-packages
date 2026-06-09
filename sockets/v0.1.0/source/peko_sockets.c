@@ -977,6 +977,77 @@ const char *peko_create_request(const char *host, int port,
 }
 
 /* -------------------------------------------------------------------------
+ * peko_create_request_oneshot
+ *
+ * Fire-and-forget send. Connects to host:port, sends the full request bytes,
+ * then half-closes the write side so the peer reaches end-of-stream as soon
+ * as the send completes. Does not read a response. Returns 0 on success and
+ * non-zero on failure.
+ *
+ * Use this from Peko send_no_response, especially for raw TCP messages where
+ * the peer reads until EOF and has no other way to know the message is done.
+ * ---------------------------------------------------------------------- */
+
+int peko_create_request_oneshot(const char *host, int port,
+                                const char *request)
+{
+    struct addrinfo hints, *res = NULL;
+    peko_socket_t   sock;
+    char            port_str[16];
+    int             rc;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    pgc_begin_blocking();
+    rc = getaddrinfo(host, port_str, &hints, &res);
+    pgc_end_blocking();
+    if (rc != 0 || !res)
+        return 1;
+
+    sock = PEKO_INVALID_SOCKET;
+    {
+        struct addrinfo *ai;
+        for (ai = res; ai != NULL; ai = ai->ai_next) {
+            peko_socket_t s = socket(ai->ai_family, ai->ai_socktype,
+                                     ai->ai_protocol);
+            if (s == PEKO_INVALID_SOCKET)
+                continue;
+            pgc_begin_blocking();
+            int crc = connect(s, ai->ai_addr, (int)ai->ai_addrlen);
+            pgc_end_blocking();
+            if (crc == 0) {
+                sock = s;
+                break;
+            }
+            peko_close_socket(s);
+        }
+    }
+    freeaddrinfo(res);
+
+    if (sock == PEKO_INVALID_SOCKET)
+        return 2;
+
+    if (send_all(sock, request, strlen(request)) != 0) {
+        peko_close_socket(sock);
+        return 3;
+    }
+
+    /* Half-close the write side so the peer's read loop sees EOF and stops
+     * waiting for more bytes. Without this a peer reading until close (for
+     * example a raw TCP server reading a message of unknown length) would
+     * block until the receive-side timeout fires. */
+    peko_shutdown_write(sock);
+
+    peko_close_socket(sock);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
  * Shared response helpers
  * ---------------------------------------------------------------------- */
 

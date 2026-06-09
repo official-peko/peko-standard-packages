@@ -78,6 +78,7 @@ platform macos {
 
 [external gcsafe] fn peko_create_request(host: cstr, port: int, request: cstr) => string;
 [external gcsafe] fn peko_create_request_tls(host: cstr, port: int, request: cstr) => string;
+[external gcsafe] fn peko_create_request_oneshot(host: cstr, port: int, request: cstr) => int;
 [external gcsafe] fn peko_stream_request(
     host: cstr, port: int, request: cstr,
     on_headers: (int)(Pointer<void>, cstr), headers_ctx: Pointer<void>,
@@ -1134,6 +1135,10 @@ class Request {
     }
 
     /// Sends this request on a new thread and does not wait for a response.
+    /// Closes the write side of the socket as soon as the send completes so
+    /// the peer reaches end-of-stream right away. This matters for raw TCP
+    /// peers that read until close, since without an early write-close the
+    /// peer would block until its own receive timeout fires.
     ///
     /// @param host the host to connect to
     /// @param port the port to connect to
@@ -1144,7 +1149,7 @@ class Request {
             if secure {
                 extern::peko_create_request_tls(host as string, port, wire as string);
             } else {
-                extern::peko_create_request(host as string, port, wire as string);
+                extern::peko_create_request_oneshot(host as string, port, wire as string);
             }
         });
     }
